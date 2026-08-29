@@ -1077,6 +1077,7 @@ export default function Home() {
     [lookOffset, setLookOffset] = useState(0),
     [sceneView, setSceneView] = useState<"view" | "profile">("view"),
     [visible, setVisible] = useState([true, true, true]),
+    [dataPanel, setDataPanel] = useState(false),
     [data, setData] = useState<SceneData | null>(null),
     [loading, setLoading] = useState(true),
     [clock, setClock] = useState<number | null>(null),
@@ -1862,7 +1863,7 @@ export default function Home() {
                 : "当前使用安全占位场景"}
           </div>
         </div>
-        <aside className="right-panel panel">
+        <aside className={`right-panel panel${dataPanel ? " open" : ""}`}>
           <div className="score-head">
             <span>云底受光指数</span>
             <small>文档定量模型</small>
@@ -1991,6 +1992,19 @@ export default function Home() {
           </div>
         </aside>
       </section>
+      <div
+        className={`panel-backdrop${dataPanel ? " open" : ""}`}
+        onClick={() => setDataPanel(false)}
+        aria-hidden="true"
+      />
+      <button
+        className="mobile-data-btn"
+        onClick={() => setDataPanel((v) => !v)}
+        aria-expanded={dataPanel}
+      >
+        <Database size={13} />
+        {dataPanel ? "收起" : "数据"}
+      </button>
       <AmapPicker
         open={mapOpen}
         initial={loc}
