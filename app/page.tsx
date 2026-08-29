@@ -33,6 +33,7 @@ import { getPosition, getTimes } from "suncalc";
 import TerrainProfile from "./terrain-profile";
 import { HISTORY_DAYS, forecastUpdateAt, sceneUrls, nextSunUrl } from "./scene-urls";
 import { highCloudPlan, totalHazePlan } from "./cloud-render";
+import { sunDiskStats, sunTintAlpha } from "./sun-image";
 
 type Mode = "dawn" | "sunset";
 type Solar = { altitude: number; azimuth: number };
@@ -480,7 +481,9 @@ function Scene({
   const ref = useRef<HTMLCanvasElement>(null),
     drag = useRef({ on: false, x: 0 }),
     sunImg = useRef<HTMLImageElement | null>(null),
-    sunTried = useRef<string[]>([]);
+    sunTried = useRef<string[]>([]),
+    sunFrac = useRef(0.9),
+    sunSat = useRef(0.7);
   const [look, setLook] = useState(0);
   useEffect(() => {
     let alive = true;
@@ -490,7 +493,27 @@ function Scene({
       sunTried.current.push(url);
       const img = new Image();
       img.onload = () => {
-        if (alive) sunImg.current = img;
+        if (!alive) return;
+        sunImg.current = img;
+        // 采样日面占比与饱和度：白光日面占比约 95%、饱和度很低（几乎纯白），
+        // 极紫外假色占比约 89% 且偏暖；据此精确铺满并决定暖色着色强度。
+        try {
+          const s = 48,
+            cv = document.createElement("canvas");
+          cv.width = s;
+          cv.height = s;
+          const cx = cv.getContext("2d", { willReadFrequently: true });
+          if (cx) {
+            cx.drawImage(img, 0, 0, s, s);
+            const stats = sunDiskStats(cx.getImageData(0, 0, s, s).data, s, s);
+            if (stats.disk) {
+              sunFrac.current = stats.frac;
+              sunSat.current = stats.saturation;
+            }
+          }
+        } catch {
+          /* 保留默认值 */
+        }
       };
       img.onerror = () => {
         if (alive) load();
@@ -592,7 +615,8 @@ function Scene({
       if (sImg && sImg.naturalWidth > 0) {
         x.save();
         x.clip();
-        const k = (sunR * 2) / (sImg.naturalWidth * 0.8);
+        // 按实测日面占比铺满圆形（避免硬编码 0.8 导致日面被裁或露黑边）
+        const k = (sunR * 2) / (sImg.naturalWidth * sunFrac.current);
         x.drawImage(
           sImg,
           sx - sunR,
@@ -600,7 +624,13 @@ function Scene({
           sImg.naturalWidth * k,
           sImg.naturalHeight * k,
         );
-        x.fillStyle = "rgba(255,172,86,0.25)";
+        // 白光日面（低饱和）叠加暖色径向渐变，使其融入日落氛围并保留黑子等表面细节
+        const tintA = sunTintAlpha(sunSat.current),
+          warm = x.createRadialGradient(sx, sy, sunR * 0.08, sx, sy, sunR);
+        warm.addColorStop(0, `rgba(255,240,195,${tintA})`);
+        warm.addColorStop(0.55, `rgba(255,180,100,${tintA * 0.92})`);
+        warm.addColorStop(1, `rgba(255,120,52,${tintA})`);
+        x.fillStyle = warm;
         x.fill();
         x.restore();
       } else {

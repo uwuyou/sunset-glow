@@ -88,6 +88,10 @@ test("nextSunUrl 全部尝试后返回 null", () => {
   assert.equal(nextSunUrl([...NASA_SUN_URLS]), null);
 });
 
+test("NASA_SUN_URLS 首选 HMI 白光日面（肉眼可见的真实太阳）", () => {
+  assert.match(NASA_SUN_URLS[0], /HMIIF/);
+});
+
 test("NASA_SUN_URLS 均为 https 实时图源且含备选", () => {
   assert.ok(NASA_SUN_URLS.length >= 2);
   for (const u of NASA_SUN_URLS) assert.match(u, /^https:\/\//);

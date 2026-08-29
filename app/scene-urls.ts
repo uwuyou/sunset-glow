@@ -5,10 +5,11 @@
 export const HISTORY_DAYS = 30;
 
 // NASA SDO 实时太阳图源（约每 15 分钟更新一张；官方允许热链，但无 CORS 头，
-// 仅用于画布 drawImage 显示）。首个为经典的 0304 极紫外假色，备选为连续光谱白光日面。
+// 仅用于画布 drawImage 显示）。首选 HMI 白光日面（肉眼可见的真实太阳：白盘带
+// 黑子与米粒组织），备选 0304 极紫外假色；全部失败后调用方回退到程序化太阳。
 export const NASA_SUN_URLS = [
-  "https://sdo.gsfc.nasa.gov/assets/img/latest/latest_1024_0304.jpg",
   "https://sdo.gsfc.nasa.gov/assets/img/latest/latest_1024_HMIIF.jpg",
+  "https://sdo.gsfc.nasa.gov/assets/img/latest/latest_1024_0304.jpg",
 ];
 
 // 返回下一个未尝试过的 NASA 图源；全部失败后返回 null（调用方回退到程序化太阳）。
