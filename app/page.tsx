@@ -32,6 +32,7 @@ import {
 import { getPosition, getTimes } from "suncalc";
 import TerrainProfile from "./terrain-profile";
 import { HISTORY_DAYS, forecastUpdateAt, sceneUrls } from "./scene-urls";
+import { highCloudPlan, totalHazePlan } from "./cloud-render";
 
 type Mode = "dawn" | "sunset";
 type Solar = { altitude: number; azimuth: number };
@@ -826,10 +827,11 @@ function Scene({
         midY = cloudY(heights[1] || 5.5),
         lowY = cloudY(heights[0] || 1.5);
       if (visible[2]) {
-        if (cover[2] > 62)
+        const hp = highCloudPlan(cover[2]);
+        if (hp.mode === "deck")
           texturedDeck(
             highY,
-            cover[2] * 0.72,
+            hp.amount,
             highTone,
             0.55,
             false,
@@ -842,11 +844,12 @@ function Scene({
       }
       if (visible[0])
         texturedDeck(lowY, cover[0], lowTone, 1.18, true, illumination[0]);
-      const totalCover = 100 * (1 - (1-cover[0]/100)*(1-cover[1]/100)*(1-cover[2]/100));
-      if (totalCover > 38) {
+      const totalCover = 100 * (1 - (1-cover[0]/100)*(1-cover[1]/100)*(1-cover[2]/100)),
+        totalHaze = totalHazePlan(totalCover);
+      if (totalHaze.visible) {
         const deck = x.createLinearGradient(0, highY - 28, 0, lowY + 70);
-        deck.addColorStop(0, `rgba(${highTone.join(",")},${Math.max(0,.12+(totalCover-38)/360)})`);
-        deck.addColorStop(1, `rgba(${midTone.join(",")},${Math.max(0,.08+(totalCover-38)/420)})`);
+        deck.addColorStop(0, `rgba(${highTone.join(",")},${totalHaze.alphaTop.toFixed(3)})`);
+        deck.addColorStop(1, `rgba(${midTone.join(",")},${totalHaze.alphaBottom.toFixed(3)})`);
         x.fillStyle = deck;
         x.fillRect(-20, highY-30, w+40, Math.max(70, lowY-highY+100));
       }
@@ -1195,6 +1198,9 @@ export default function Home() {
       Number(hourly?.cloud_cover_mid?.[idx] || 0),
       Number(hourly?.cloud_cover_high?.[idx] || 0),
     ],
+    totalCloud = Math.round(
+      100 * (1 - (1 - cover[0] / 100) * (1 - cover[1] / 100) * (1 - cover[2] / 100)),
+    ),
     visibility = Number(hourly?.visibility?.[idx] || 15000),
     stationElevation = Number(data?.weather.elevation || 500),
     heights = [
@@ -1896,6 +1902,7 @@ export default function Home() {
             {[
               ["几何可照亮", geometryScore],
               ["目标云量", cloudScore],
+              ["总云量", totalCloud],
               ["AOD通透", airScore],
               ["上游云廊", corridorScore],
             ].map(([name, value]) => (
