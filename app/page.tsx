@@ -31,7 +31,7 @@ import {
 } from "@/components/ui/dialog";
 import { getPosition, getTimes } from "suncalc";
 import TerrainProfile from "./terrain-profile";
-import { HISTORY_DAYS, forecastUpdateAt, sceneUrls } from "./scene-urls";
+import { HISTORY_DAYS, forecastUpdateAt, sceneUrls, nextSunUrl } from "./scene-urls";
 import { highCloudPlan, totalHazePlan } from "./cloud-render";
 
 type Mode = "dawn" | "sunset";
@@ -478,8 +478,30 @@ function Scene({
   onLookChange: (look: number) => void;
 }) {
   const ref = useRef<HTMLCanvasElement>(null),
-    drag = useRef({ on: false, x: 0 });
+    drag = useRef({ on: false, x: 0 }),
+    sunImg = useRef<HTMLImageElement | null>(null),
+    sunTried = useRef<string[]>([]);
   const [look, setLook] = useState(0);
+  useEffect(() => {
+    let alive = true;
+    const load = () => {
+      const url = nextSunUrl(sunTried.current);
+      if (!url) return;
+      sunTried.current.push(url);
+      const img = new Image();
+      img.onload = () => {
+        if (alive) sunImg.current = img;
+      };
+      img.onerror = () => {
+        if (alive) load();
+      };
+      img.src = url;
+    };
+    load();
+    return () => {
+      alive = false;
+    };
+  }, []);
   useEffect(() => {
     const c = ref.current,
       x = c?.getContext("2d");
@@ -560,16 +582,31 @@ function Scene({
       g.addColorStop(1, "rgba(255,120,50,0)");
       x.fillStyle = g;
       x.fillRect(0, 0, w, hor);
+      const sunR = Math.max(
+          3,
+          Math.min(w * 0.16, (0.53 / referenceFov) * w * 0.5),
+        ),
+        sImg = sunImg.current;
       x.beginPath();
-      x.arc(
-        sx,
-        sy,
-        Math.max(3, Math.min(w * 0.16, (0.53 / referenceFov) * w * 0.5)),
-        0,
-        Math.PI * 2,
-      );
-      x.fillStyle = "#fff1b3";
-      x.fill();
+      x.arc(sx, sy, sunR, 0, Math.PI * 2);
+      if (sImg && sImg.naturalWidth > 0) {
+        x.save();
+        x.clip();
+        const k = (sunR * 2) / (sImg.naturalWidth * 0.8);
+        x.drawImage(
+          sImg,
+          sx - sunR,
+          sy - sunR,
+          sImg.naturalWidth * k,
+          sImg.naturalHeight * k,
+        );
+        x.fillStyle = "rgba(255,172,86,0.25)";
+        x.fill();
+        x.restore();
+      } else {
+        x.fillStyle = "#fff1b3";
+        x.fill();
+      }
       // 巧摄式太阳轨迹弧线：以日出/日落为锚点 ±150 分钟，随取景环顾同步平移
       if (event) {
         x.save();

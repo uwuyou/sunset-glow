@@ -16,7 +16,7 @@ after(async () => {
   await vite.close();
 });
 
-const { forecastUpdateAt, sceneUrls, HISTORY_DAYS } =
+const { forecastUpdateAt, sceneUrls, HISTORY_DAYS, nextSunUrl, NASA_SUN_URLS } =
   await vite.ssrLoadModule("/app/scene-urls.ts");
 
 const base = {
@@ -74,4 +74,21 @@ test("sceneUrls 保留原有 7 天预报与所需变量字段", () => {
 test("sceneUrls 支持自定义历史回溯天数", () => {
   const urls = sceneUrls({ ...base, historyDays: 92 });
   assert.match(urls.wf, /past_days=92/);
+});
+
+test("nextSunUrl 优先返回首个未尝试的 NASA 图源", () => {
+  assert.equal(nextSunUrl([]), NASA_SUN_URLS[0]);
+});
+
+test("nextSunUrl 已尝试首个后返回备选图源", () => {
+  assert.equal(nextSunUrl([NASA_SUN_URLS[0]]), NASA_SUN_URLS[1]);
+});
+
+test("nextSunUrl 全部尝试后返回 null", () => {
+  assert.equal(nextSunUrl([...NASA_SUN_URLS]), null);
+});
+
+test("NASA_SUN_URLS 均为 https 实时图源且含备选", () => {
+  assert.ok(NASA_SUN_URLS.length >= 2);
+  for (const u of NASA_SUN_URLS) assert.match(u, /^https:\/\//);
 });

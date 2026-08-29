@@ -4,6 +4,18 @@
 // 历史回溯天数：预报日期可选择过去的最近 30 天（Open-Meteo 支持最多 92 天）。
 export const HISTORY_DAYS = 30;
 
+// NASA SDO 实时太阳图源（约每 15 分钟更新一张；官方允许热链，但无 CORS 头，
+// 仅用于画布 drawImage 显示）。首个为经典的 0304 极紫外假色，备选为连续光谱白光日面。
+export const NASA_SUN_URLS = [
+  "https://sdo.gsfc.nasa.gov/assets/img/latest/latest_1024_0304.jpg",
+  "https://sdo.gsfc.nasa.gov/assets/img/latest/latest_1024_HMIIF.jpg",
+];
+
+// 返回下一个未尝试过的 NASA 图源；全部失败后返回 null（调用方回退到程序化太阳）。
+export function nextSunUrl(tried: string[]): string | null {
+  return NASA_SUN_URLS.find((u) => !tried.includes(u)) ?? null;
+}
+
 // ECMWF IFS 数值预报每 6 小时更新一个时次（00/06/12/18 UTC）。
 // 数据更新时间跟随数值预报的结果：回落到 now 之前最近一次已发布的模型时次。
 export function forecastUpdateAt(now: Date): Date {
