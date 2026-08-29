@@ -18,7 +18,6 @@ export type SceneUrls = {
   vis: string;
   air: string;
   corridor: string;
-  ens: string;
 };
 
 export function sceneUrls(params: {
@@ -43,6 +42,5 @@ export function sceneUrls(params: {
     vis: `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&hourly=visibility,${cloudVars},precipitation,cape,wind_speed_500hPa,wind_direction_500hPa&${query}`,
     air: `https://air-quality-api.open-meteo.com/v1/air-quality?latitude=${lat}&longitude=${lon}&hourly=aerosol_optical_depth,pm2_5&${query}`,
     corridor: `https://api.open-meteo.com/v1/ecmwf?latitude=${corridorLats}&longitude=${corridorLons}&hourly=${cloudVars}&${query}`,
-    ens: `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&hourly=${cloudVars}&models=ecmwf_ifs025,gfs_seamless,icon_seamless&${query}`,
   };
 }
