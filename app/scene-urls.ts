@@ -5,12 +5,28 @@
 export const HISTORY_DAYS = 30;
 
 // NASA SDO 实时太阳图源（约每 15 分钟更新一张；官方允许热链，但无 CORS 头，
-// 仅用于画布 drawImage 显示）。首选 HMI 白光日面（肉眼可见的真实太阳：白盘带
-// 黑子与米粒组织），备选 0304 极紫外假色；全部失败后调用方回退到程序化太阳。
+// 仅用于画布 drawImage 显示）。首选 HMI 白光连续谱（肉眼可见的真实太阳：
+// 亮盘带黑子与米粒组织，正是用户要的"有太阳黑子的那张"），备选 0304 极紫外假色；
+// 全部失败后调用方回退到程序化太阳。
 export const NASA_SUN_URLS = [
   "https://sdo.gsfc.nasa.gov/assets/img/latest/latest_1024_HMIIF.jpg",
   "https://sdo.gsfc.nasa.gov/assets/img/latest/latest_1024_0304.jpg",
 ];
+
+// 各图源的日面与色调预设。由于 SDO 图源无 CORS 头，运行时无法读取像素，
+// 因此预先离线测量：diskFrac=日面直径占整图宽度的比例，saturation=日面亮区平均饱和度。
+// HMIIF 白光日面占比约 0.948、几乎纯白(低饱和)；0304 极紫外占比约 0.886、偏暖。
+export type SunSourceMeta = { diskFrac: number; saturation: number };
+
+export const SUN_SOURCE_META: Record<string, SunSourceMeta> = {
+  [NASA_SUN_URLS[0]]: { diskFrac: 0.948, saturation: 0.05 },
+  [NASA_SUN_URLS[1]]: { diskFrac: 0.886, saturation: 0.6 },
+};
+
+// 返回指定图源的日面占比与饱和度；未知图源回退到稳妥默认值。
+export function sunSourceMeta(url: string): SunSourceMeta {
+  return SUN_SOURCE_META[url] ?? { diskFrac: 0.9, saturation: 0.5 };
+}
 
 // 返回下一个未尝试过的 NASA 图源；全部失败后返回 null（调用方回退到程序化太阳）。
 export function nextSunUrl(tried: string[]): string | null {

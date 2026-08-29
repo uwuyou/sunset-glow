@@ -49,9 +49,10 @@ export function sunDiskStats(
   return { frac, saturation: sumSat / diskPx, disk: true };
 }
 
-// 白光日面（低饱和）需更强的暖色叠加才能融入日落；已呈暖色/假色的图则轻着色。
-// 返回叠加暖色径向渐变的总透明度（0.14 ~ 0.5）。
+// 白光日面（低饱和）叠加略强的暖色才能融入日落，但用户希望黑子清晰可见，
+// 因此整体着色从轻：返回叠加暖色径向渐变的总透明度（0.06 ~ 0.22），
+// 让亮盘保持亮白、暗黑子保持明显对比。
 export function sunTintAlpha(saturation: number): number {
   const t = Math.max(0, Math.min(1, 1 - saturation));
-  return 0.14 + t * 0.36;
+  return 0.06 + t * 0.16;
 }

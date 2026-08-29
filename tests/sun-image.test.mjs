@@ -62,13 +62,13 @@ test("sunDiskStats 全黑背景返回 disk:false 并给默认占比", () => {
 
 test("sunTintAlpha 白光日面(低饱和)着色更强, 暖色日面更轻", () => {
   assert.ok(sunTintAlpha(0) > sunTintAlpha(0.8));
-  assert.ok(sunTintAlpha(0) >= 0.45);
-  assert.ok(sunTintAlpha(1) >= 0.14);
+  assert.ok(sunTintAlpha(0) >= 0.2);
+  assert.ok(sunTintAlpha(1) >= 0.06);
 });
 
-test("sunTintAlpha 输出限定在 0.14~0.5 区间", () => {
+test("sunTintAlpha 输出限定在 0.06~0.22 区间", () => {
   for (const sat of [0, 0.3, 0.6, 1, -1, 2]) {
     const a = sunTintAlpha(sat);
-    assert.ok(a >= 0.14 && a <= 0.5, `sat=${sat} -> ${a}`);
+    assert.ok(a >= 0.06 && a <= 0.22, `sat=${sat} -> ${a}`);
   }
 });

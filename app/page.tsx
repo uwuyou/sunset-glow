@@ -31,7 +31,7 @@ import {
 } from "@/components/ui/dialog";
 import { getPosition, getTimes } from "suncalc";
 import TerrainProfile from "./terrain-profile";
-import { HISTORY_DAYS, forecastUpdateAt, sceneUrls, nextSunUrl } from "./scene-urls";
+import { HISTORY_DAYS, forecastUpdateAt, sceneUrls, nextSunUrl, sunSourceMeta } from "./scene-urls";
 import { highCloudPlan, totalHazePlan } from "./cloud-render";
 import { sunDiskStats, sunTintAlpha } from "./sun-image";
 
@@ -495,8 +495,11 @@ function Scene({
       img.onload = () => {
         if (!alive) return;
         sunImg.current = img;
-        // 采样日面占比与饱和度：白光日面占比约 95%、饱和度很低（几乎纯白），
-        // 极紫外假色占比约 89% 且偏暖；据此精确铺满并决定暖色着色强度。
+        // 采用该图源预设的日面占比与饱和度（SDO 无 CORS 头，运行时无法读像素，
+        // 预设为离线实测值）；若图源意外携带 CORS 头，再以运行时采样覆盖。
+        const preset = sunSourceMeta(url);
+        sunFrac.current = preset.diskFrac;
+        sunSat.current = preset.saturation;
         try {
           const s = 48,
             cv = document.createElement("canvas");
@@ -512,7 +515,7 @@ function Scene({
             }
           }
         } catch {
-          /* 保留默认值 */
+          /* 无 CORS 头导致画布被污染时，沿用预设值 */
         }
       };
       img.onerror = () => {
@@ -617,6 +620,8 @@ function Scene({
         x.clip();
         // 按实测日面占比铺满圆形（避免硬编码 0.8 导致日面被裁或露黑边）
         const k = (sunR * 2) / (sImg.naturalWidth * sunFrac.current);
+        // 轻微增强对比度，让白光日面上的黑子更清晰（无需读像素，不触发 CORS 污染）
+        x.filter = "brightness(1.03) contrast(1.4)";
         x.drawImage(
           sImg,
           sx - sunR,
@@ -624,7 +629,8 @@ function Scene({
           sImg.naturalWidth * k,
           sImg.naturalHeight * k,
         );
-        // 白光日面（低饱和）叠加暖色径向渐变，使其融入日落氛围并保留黑子等表面细节
+        x.filter = "none";
+        // 白光日面（低饱和）叠加轻量暖色径向渐变，保留黑子对比度同时融入日落氛围
         const tintA = sunTintAlpha(sunSat.current),
           warm = x.createRadialGradient(sx, sy, sunR * 0.08, sx, sy, sunR);
         warm.addColorStop(0, `rgba(255,240,195,${tintA})`);

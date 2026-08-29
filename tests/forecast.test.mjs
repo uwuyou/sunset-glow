@@ -16,7 +16,7 @@ after(async () => {
   await vite.close();
 });
 
-const { forecastUpdateAt, sceneUrls, HISTORY_DAYS, nextSunUrl, NASA_SUN_URLS } =
+const { forecastUpdateAt, sceneUrls, HISTORY_DAYS, nextSunUrl, NASA_SUN_URLS, sunSourceMeta } =
   await vite.ssrLoadModule("/app/scene-urls.ts");
 
 const base = {
@@ -95,4 +95,21 @@ test("NASA_SUN_URLS 首选 HMI 白光日面（肉眼可见的真实太阳）", (
 test("NASA_SUN_URLS 均为 https 实时图源且含备选", () => {
   assert.ok(NASA_SUN_URLS.length >= 2);
   for (const u of NASA_SUN_URLS) assert.match(u, /^https:\/\//);
+});
+
+test("sunSourceMeta 白光日面预设: 占比约 0.948、低饱和", () => {
+  const m = sunSourceMeta(NASA_SUN_URLS[0]);
+  assert.ok(Math.abs(m.diskFrac - 0.948) < 0.001);
+  assert.ok(m.saturation < 0.1);
+});
+
+test("sunSourceMeta 极紫外假色预设: 占比约 0.886、偏暖", () => {
+  const m = sunSourceMeta(NASA_SUN_URLS[1]);
+  assert.ok(Math.abs(m.diskFrac - 0.886) < 0.001);
+  assert.ok(m.saturation > 0.5);
+});
+
+test("sunSourceMeta 未知图源回退到默认占比 0.9", () => {
+  const m = sunSourceMeta("https://example.com/sun.jpg");
+  assert.equal(m.diskFrac, 0.9);
 });
