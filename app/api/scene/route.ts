@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { forecastUpdateAt, sceneUrls } from "../../scene-urls";
+import { averageModels } from "../../cloud-render";
 
 const R = 6371;
 function destination(lat: number, lon: number, bearing: number, km: number) {
@@ -49,15 +50,17 @@ export async function GET(req: NextRequest) {
     vis: visibility,
     air,
     corridor,
+    ens,
   } = sceneUrls({ lat, lon, lats, lons, corridorLats, corridorLons });
   try {
-    const [wfResult, demResult, visResult, aqResult, corResult] =
+    const [wfResult, demResult, visResult, aqResult, corResult, ensResult] =
       await Promise.allSettled([
         fetch(forecast),
         fetch(elevation),
         fetch(visibility),
         fetch(air),
         fetch(corridor),
+        fetch(ens),
       ]);
     if (wfResult.status !== "fulfilled" || !wfResult.value.ok)
       throw new Error(
@@ -83,6 +86,14 @@ export async function GET(req: NextRequest) {
       weather.hourly.aerosol_optical_depth =
         a.hourly?.aerosol_optical_depth || [];
       weather.hourly.pm2_5 = a.hourly?.pm2_5 || [];
+    }
+    if (ensResult.status === "fulfilled" && ensResult.value.ok) {
+      const eh = (await ensResult.value.json())?.hourly;
+      if (eh) {
+        weather.hourly.cloud_cover_low = averageModels(eh.cloud_cover_low, 0);
+        weather.hourly.cloud_cover_mid = averageModels(eh.cloud_cover_mid, 0);
+        weather.hourly.cloud_cover_high = averageModels(eh.cloud_cover_high, 0);
+      }
     }
     const corridorData =
       corResult.status === "fulfilled" && corResult.value.ok

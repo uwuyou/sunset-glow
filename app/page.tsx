@@ -32,7 +32,7 @@ import {
 import { getPosition, getTimes } from "suncalc";
 import TerrainProfile from "./terrain-profile";
 import { HISTORY_DAYS, forecastUpdateAt, sceneUrls } from "./scene-urls";
-import { highCloudPlan, totalHazePlan } from "./cloud-render";
+import { highCloudPlan, totalHazePlan, averageModels } from "./cloud-render";
 
 type Mode = "dawn" | "sunset";
 type Solar = { altitude: number; azimuth: number };
@@ -382,14 +382,16 @@ async function directSceneData(
     vis: visUrl,
     air: airUrl,
     corridor: corridorUrl,
+    ens: ensUrl,
   } = sceneUrls({ lat, lon, lats, lons, corridorLats, corridorLons });
-  const [wfResult, demResult, visResult, aqResult, corResult] =
+  const [wfResult, demResult, visResult, aqResult, corResult, ensResult] =
     await Promise.allSettled([
       fetch(wfUrl, { signal }),
       fetch(demUrl, { signal }),
       fetch(visUrl, { signal }),
       fetch(airUrl, { signal }),
       fetch(corridorUrl, { signal }),
+      fetch(ensUrl, { signal }),
     ]);
   if (wfResult.status !== "fulfilled" || !wfResult.value.ok)
     throw new Error("ECMWF 暂时无法连接");
@@ -411,6 +413,14 @@ async function directSceneData(
     weather.hourly.aerosol_optical_depth =
       a.hourly?.aerosol_optical_depth || [];
     weather.hourly.pm2_5 = a.hourly?.pm2_5 || [];
+  }
+  if (ensResult.status === "fulfilled" && ensResult.value.ok) {
+    const eh = (await ensResult.value.json())?.hourly;
+    if (eh) {
+      weather.hourly.cloud_cover_low = averageModels(eh.cloud_cover_low, 0);
+      weather.hourly.cloud_cover_mid = averageModels(eh.cloud_cover_mid, 0);
+      weather.hourly.cloud_cover_high = averageModels(eh.cloud_cover_high, 0);
+    }
   }
   const corridorData =
     corResult.status === "fulfilled" && corResult.value.ok
@@ -845,7 +855,7 @@ function Scene({
       if (visible[0])
         texturedDeck(lowY, cover[0], lowTone, 1.18, true, illumination[0]);
       const totalCover = 100 * (1 - (1-cover[0]/100)*(1-cover[1]/100)*(1-cover[2]/100)),
-        totalHaze = totalHazePlan(totalCover);
+        totalHaze = totalHazePlan(totalCover, aod);
       if (totalHaze.visible) {
         const deck = x.createLinearGradient(0, highY - 28, 0, lowY + 70);
         deck.addColorStop(0, `rgba(${highTone.join(",")},${totalHaze.alphaTop.toFixed(3)})`);
