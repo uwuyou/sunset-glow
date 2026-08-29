@@ -31,6 +31,7 @@ import {
 } from "@/components/ui/dialog";
 import { getPosition, getTimes } from "suncalc";
 import TerrainProfile from "./terrain-profile";
+import { HISTORY_DAYS, forecastUpdateAt, sceneUrls } from "./scene-urls";
 
 type Mode = "dawn" | "sunset";
 type Solar = { altitude: number; azimuth: number };
@@ -53,6 +54,7 @@ type SceneData = {
   comparison?: { hourly: Record<string, (number | string)[]> } | null;
   satellite: string;
   updated: string;
+  modelUpdate: string;
 };
 const places = {
   "成都·天府广场": { lat: 30.657, lon: 104.066 },
@@ -373,13 +375,13 @@ async function directSceneData(
     );
   const corridorLats = corridorPoints.map((p) => p[0].toFixed(5)).join(","),
     corridorLons = corridorPoints.map((p) => p[1].toFixed(5)).join(",");
-  const vars =
-    "cloud_cover_low,cloud_cover_mid,cloud_cover_high,direct_radiation,diffuse_radiation,boundary_layer_height,geopotential_height_850hPa,geopotential_height_500hPa,geopotential_height_250hPa";
-  const wfUrl = `https://api.open-meteo.com/v1/ecmwf?latitude=${lat}&longitude=${lon}&hourly=${vars}&daily=sunrise,sunset&timezone=Asia%2FShanghai&forecast_days=7`;
-  const demUrl = `https://api.open-meteo.com/v1/elevation?latitude=${lats}&longitude=${lons}`;
-  const visUrl = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&hourly=visibility,cloud_cover_low,cloud_cover_mid,cloud_cover_high,precipitation,cape,wind_speed_500hPa,wind_direction_500hPa&timezone=Asia%2FShanghai&forecast_days=7`;
-  const airUrl = `https://air-quality-api.open-meteo.com/v1/air-quality?latitude=${lat}&longitude=${lon}&hourly=aerosol_optical_depth,pm2_5&timezone=Asia%2FShanghai&forecast_days=7`;
-  const corridorUrl = `https://api.open-meteo.com/v1/ecmwf?latitude=${corridorLats}&longitude=${corridorLons}&hourly=cloud_cover_low,cloud_cover_mid,cloud_cover_high&timezone=Asia%2FShanghai&forecast_days=7`;
+  const {
+    wf: wfUrl,
+    dem: demUrl,
+    vis: visUrl,
+    air: airUrl,
+    corridor: corridorUrl,
+  } = sceneUrls({ lat, lon, lats, lons, corridorLats, corridorLons });
   const [wfResult, demResult, visResult, aqResult, corResult] =
     await Promise.allSettled([
       fetch(wfUrl, { signal }),
@@ -429,6 +431,7 @@ async function directSceneData(
     },
     satellite,
     updated: new Date().toISOString(),
+    modelUpdate: forecastUpdateAt(new Date()).toISOString(),
   };
 }
 
@@ -1081,7 +1084,6 @@ export default function Home() {
     [data, setData] = useState<SceneData | null>(null),
     [loading, setLoading] = useState(true),
     [clock, setClock] = useState<number | null>(null),
-    [updatedAt, setUpdatedAt] = useState<number | null>(null),
     [nextRefreshAt, setNextRefreshAt] = useState(0),
     [error, setError] = useState("");
   const requestRef = useRef({
@@ -1123,7 +1125,6 @@ export default function Home() {
         return;
       cacheRef.current.set(key, next);
       setData(next);
-      setUpdatedAt(Date.now());
       setNextRefreshAt(Date.now() + 600000);
     } catch (e) {
       if (controller.signal.aborted || requestId !== requestRef.current.id)
@@ -1531,6 +1532,14 @@ export default function Home() {
       day: "numeric",
       weekday: "short",
     }),
+    modelUpdateLabel = data?.modelUpdate
+      ? new Date(data.modelUpdate).toLocaleTimeString("zh-CN", {
+          timeZone: "Asia/Shanghai",
+          hour: "2-digit",
+          minute: "2-digit",
+          hour12: false,
+        })
+      : "--:--",
     selectDate = (next: string) => {
       if (!availableDates.includes(next)) return;
       setSelectedDate(next);
@@ -1639,7 +1648,7 @@ export default function Home() {
                 <ChevronRight size={15} />
               </button>
             </div>
-            <small>{selectedDateLabel} · 未来 7 天</small>
+            <small>{selectedDateLabel} · 回溯 {HISTORY_DAYS} 天 · 未来 7 天</small>
           </div>
           <button className="location-btn" onClick={load}>
             <RefreshCw size={15} className={loading ? "spin" : ""} />
@@ -1647,7 +1656,7 @@ export default function Home() {
           </button>
           <div className="data-clock">
             <span>当前 {clock === null ? "--:--:--" : new Date(clock).toLocaleTimeString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false })}</span>
-            <span>更新 {updatedAt ? new Date(updatedAt).toLocaleTimeString("zh-CN", { timeZone: "Asia/Shanghai", hour: "2-digit", minute: "2-digit" }) : "--:--"}</span>
+            <span title="ECMWF 数值预报更新时次">数据更新 {modelUpdateLabel}</span>
             <b>下次刷新 {clock === null ? "--" : `${Math.max(0, Math.ceil((nextRefreshAt - clock) / 1000))} 秒`}</b>
           </div>
           {error && <p className="error">{error}</p>}

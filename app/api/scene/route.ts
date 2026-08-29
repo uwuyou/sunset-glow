@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { forecastUpdateAt, sceneUrls } from "../../scene-urls";
 
 const R = 6371;
 function destination(lat: number, lon: number, bearing: number, km: number) {
@@ -42,13 +43,13 @@ export async function GET(req: NextRequest) {
   );
   const corridorLats = corridorPoints.map((p) => p[0].toFixed(5)).join(",");
   const corridorLons = corridorPoints.map((p) => p[1].toFixed(5)).join(",");
-  const vars =
-    "cloud_cover_low,cloud_cover_mid,cloud_cover_high,direct_radiation,diffuse_radiation,boundary_layer_height,geopotential_height_850hPa,geopotential_height_500hPa,geopotential_height_250hPa";
-  const forecast = `https://api.open-meteo.com/v1/ecmwf?latitude=${lat}&longitude=${lon}&hourly=${vars}&daily=sunrise,sunset&timezone=Asia%2FShanghai&forecast_days=7`;
-  const elevation = `https://api.open-meteo.com/v1/elevation?latitude=${lats}&longitude=${lons}`;
-  const visibility = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&hourly=visibility,cloud_cover_low,cloud_cover_mid,cloud_cover_high,precipitation,cape,wind_speed_500hPa,wind_direction_500hPa&timezone=Asia%2FShanghai&forecast_days=7`;
-  const air = `https://air-quality-api.open-meteo.com/v1/air-quality?latitude=${lat}&longitude=${lon}&hourly=aerosol_optical_depth,pm2_5&timezone=Asia%2FShanghai&forecast_days=7`;
-  const corridor = `https://api.open-meteo.com/v1/ecmwf?latitude=${corridorLats}&longitude=${corridorLons}&hourly=cloud_cover_low,cloud_cover_mid,cloud_cover_high&timezone=Asia%2FShanghai&forecast_days=7`;
+  const {
+    wf: forecast,
+    dem: elevation,
+    vis: visibility,
+    air,
+    corridor,
+  } = sceneUrls({ lat, lon, lats, lons, corridorLats, corridorLons });
   try {
     const [wfResult, demResult, visResult, aqResult, corResult] =
       await Promise.allSettled([
@@ -104,6 +105,7 @@ export async function GET(req: NextRequest) {
         },
         satellite,
         updated: new Date().toISOString(),
+        modelUpdate: forecastUpdateAt(new Date()).toISOString(),
       },
       { headers: { "Cache-Control": "public, max-age=900" } },
     );
