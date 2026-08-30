@@ -655,6 +655,27 @@ select {
   color: #718481;
   margin: 7px 0 0;
 }
+.cloudsat-strip {
+  margin-top: 18px;
+  padding: 12px;
+  border: 1px solid rgba(109, 197, 176, 0.16);
+  background: linear-gradient(180deg, rgba(20, 35, 38, 0.6), rgba(14, 26, 30, 0.8));
+  border-radius: 8px;
+}
+.panel-subtitle {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  color: #8ed1bd;
+  margin-bottom: 8px;
+}
+.cloudsat-svg {
+  width: 100%;
+  height: auto;
+  display: block;
+}
 .scene-wrap {
   position: relative;
   min-width: 0;

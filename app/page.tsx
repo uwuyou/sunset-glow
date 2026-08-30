@@ -16,6 +16,7 @@ import {
   Navigation,
   Pause,
   Play,
+  Radar,
   RefreshCw,
   Satellite,
   Sparkles,
@@ -37,10 +38,11 @@ import { sunDiskStats, sunTintAlpha } from "./sun-image";
 import { cirrusCount, deckThreshold } from "./cloud-deck";
 import {
   classifyGenus,
-  GENUS_LABEL,
   GENUS_MORPHOLOGY,
+  type CloudGenus,
   type CloudMorphology,
 } from "./cloud-genus";
+import { cloudProfile, GENUS_PROFILE, type CloudLayerProfile } from "./cloud-profile";
 
 type Mode = "dawn" | "sunset";
 type Solar = { altitude: number; azimuth: number };
@@ -1092,6 +1094,10 @@ function Scene({
       const lowMorph = GENUS_MORPHOLOGY[genus.low],
         midMorph = GENUS_MORPHOLOGY[genus.mid],
         highMorph = GENUS_MORPHOLOGY[genus.high];
+      // CloudSat 厚度联动：云属垂直结构配方（GENUS_PROFILE 厚度 km）
+      // → 纹理云层纵向拉伸倍率，厚云更"顶天立地"、薄云更扁平铺展。
+      const thicknessScale = (g: CloudGenus) =>
+        Math.max(0.7, Math.min(1.7, 0.7 + GENUS_PROFILE[g].thickness * 0.22));
       // 积雨云优先：低层判定为积雨云 Cb 时，用专属雷暴云形态（塔状+铁砧+雨幡）
       // 覆盖整个垂直柱，替代通用的低/中/高纹理云层，避免叠画干扰。
       const cbActive = visible[0] && genus.low === "cumulonimbus",
@@ -1103,7 +1109,7 @@ function Scene({
             highY,
             hp.amount,
             highTone,
-            0.55,
+            0.55 * thicknessScale(genus.high),
             false,
             illumination[2],
             highMorph,
@@ -1118,10 +1124,26 @@ function Scene({
           );
       }
       if (visible[1] && !(cbActive && genus.mid === "cumulonimbus")) {
-        texturedDeck(midY, cover[1], midTone, 0.78, false, illumination[1], midMorph);
+        texturedDeck(
+          midY,
+          cover[1],
+          midTone,
+          0.78 * thicknessScale(genus.mid),
+          false,
+          illumination[1],
+          midMorph,
+        );
       }
       if (visible[0] && !cbActive)
-        texturedDeck(lowY, cover[0], lowTone, 1.18, true, illumination[0], lowMorph);
+        texturedDeck(
+          lowY,
+          cover[0],
+          lowTone,
+          1.18 * thicknessScale(genus.low),
+          true,
+          illumination[0],
+          lowMorph,
+        );
       if (cbActive)
         cumulonimbus(
           lowY,
@@ -1641,6 +1663,14 @@ export default function Home() {
       cover: [cover[0], cover[1], cover[2]],
       heights: [effectiveHeights[0], effectiveHeights[1], effectiveHeights[2]],
     }),
+    // CloudSat 云剖面：把三层云属映射为垂直结构（云底/云顶/厚度）、
+    // 水相与降水类型，供剖面视图与右侧面板联动展示。
+    cloudProfileData: CloudLayerProfile[] = cloudProfile(
+      [genus.low, genus.mid, genus.high],
+      [effectiveHeights[0], effectiveHeights[1], effectiveHeights[2]],
+      [cover[0], cover[1], cover[2]],
+      precipitation,
+    ),
     deterministicProbability = Math.min(
       99,
       Math.round(
@@ -1731,11 +1761,8 @@ export default function Home() {
             : cover[0] > 48
               ? "低云遮挡型"
               : "云洞漏光型",
-    cloudKinds = [
-      GENUS_LABEL[genus.low],
-      GENUS_LABEL[genus.mid],
-      GENUS_LABEL[genus.high],
-    ],
+    phaseLabel = { liquid: "液态", mixed: "混合相", ice: "冰相" } as const,
+    precipLabel = { none: "无降水", rain: "雨", snow: "雪", mixed: "雨夹雪" } as const,
     scan = event
       ? Array.from({ length: 25 }, (_, i) => {
           const m = i * 5,
@@ -1994,7 +2021,12 @@ export default function Home() {
                   {c[0]} {cover[i]}%
                 </b>
                 <small>
-                  {cloudKinds[i]} · {effectiveHeights[i].toFixed(1)}km ·{" "}
+                  {cloudProfileData[i].type} · 底
+                  {cloudProfileData[i].base.toFixed(1)}–顶
+                  {cloudProfileData[i].top.toFixed(1)}km · 厚
+                  {cloudProfileData[i].thickness.toFixed(1)}km ·{" "}
+                  {phaseLabel[cloudProfileData[i].phase]} ·{" "}
+                  {precipLabel[cloudProfileData[i].precip]} ·{" "}
                   {illum[i] ? "已受光" : "未受光"} · 势能 {pot[i]}
                 </small>
               </span>
@@ -2006,6 +2038,64 @@ export default function Home() {
               />
             </label>
           ))}
+          <div className="cloudsat-strip">
+            <div className="panel-subtitle">
+              <Radar size={13} />
+              CloudSat 云剖面 · 垂直结构
+            </div>
+            <svg viewBox="0 0 300 118" className="cloudsat-svg" role="img" aria-label="CloudSat 式云剖面">
+              {[0, 3, 6, 9, 12].map((km) => {
+                const yy = 8 + ((13 - km) / 13) * 90;
+                return (
+                  <g key={km}>
+                    <line x1="0" y1={yy} x2="300" y2={yy} stroke="rgba(120,140,150,0.12)" />
+                    <text x="2" y={yy + 3} fill="#7f9390" fontSize="7">
+                      {km}
+                    </text>
+                  </g>
+                );
+              })}
+              {cloudProfileData.map((p, i) => {
+                const cx = [52, 150, 248][i],
+                  topY = 8 + ((13 - Math.min(13, p.top)) / 13) * 90,
+                  baseY = 8 + ((13 - Math.max(0, p.base)) / 13) * 90,
+                  colH = Math.max(4, baseY - topY),
+                  fill =
+                    p.phase === "ice"
+                      ? "rgba(232,240,248,0.72)"
+                      : p.phase === "mixed"
+                        ? "rgba(205,214,222,0.6)"
+                        : "rgba(158,176,189,0.55)";
+                return (
+                  <g key={i} opacity={visible[i] ? 1 : 0.3}>
+                    {p.precip !== "none" && (
+                      <line
+                        x1={cx}
+                        y1={baseY}
+                        x2={cx + (p.precip === "snow" ? 3 : 2)}
+                        y2={baseY + 15}
+                        stroke={
+                          p.precip === "snow"
+                            ? "rgba(220,232,240,0.5)"
+                            : "rgba(120,140,160,0.5)"
+                        }
+                        strokeWidth="1.4"
+                        strokeDasharray={p.precip === "snow" ? "2 2" : undefined}
+                      />
+                    )}
+                    <rect x={cx - 16} y={topY} width="32" height={colH} rx="4" fill={fill} />
+                    <text x={cx} y={baseY + 14} fill="#9db0ac" fontSize="7" textAnchor="middle">
+                      {p.type}
+                    </text>
+                  </g>
+                );
+              })}
+              <line x1="0" y1={98} x2="300" y2={98} stroke="rgba(255,214,160,0.35)" strokeDasharray="3 3" />
+              <text x="300" y="111" fill="#7f9390" fontSize="7" textAnchor="end">
+                高度 km
+              </text>
+            </svg>
+          </div>
           <div className="source-note">
             <span>实时数据链</span>
             <p>
@@ -2089,6 +2179,7 @@ export default function Home() {
                 mode={mode}
                 heights={effectiveHeights}
                 illum={illum}
+                profile={cloudProfileData}
               />
             </div>
           )}

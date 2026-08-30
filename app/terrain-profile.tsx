@@ -3,6 +3,7 @@
 // 联动焦段（FOV 窗口随焦距变化）、天空云层（低/中/高云带）、日出日落模式。
 import { useMemo } from "react";
 import { getPosition } from "suncalc";
+import type { CloudLayerProfile } from "./cloud-profile";
 
 const PI = Math.PI;
 const rad = (v: number) => (v * PI) / 180;
@@ -33,6 +34,7 @@ export default function TerrainProfile({
   mode,
   heights,
   illum,
+  profile,
 }: {
   dem: number[][];
   demDepths?: number[];
@@ -50,6 +52,7 @@ export default function TerrainProfile({
   mode: "sunset" | "dawn";
   heights?: number[];
   illum?: boolean[];
+  profile?: CloudLayerProfile[];
 }) {
   const rows = dem.length
     ? dem
@@ -184,10 +187,6 @@ export default function TerrainProfile({
       const f = Math.min(13, Math.max(0.2, km || 3)) / 13;
       return Math.max(0.6, Math.min(maxAlt - 1.2, f * maxAlt * 0.92));
     },
-    bandBase = (i: number) => {
-      const h = heights && heights.length > 2 ? heights[i] : [1.5, 5.5, 10][i];
-      return Y(cloudElev(h));
-    },
     // 单簇云：主体多子斑堆叠 + 底部暗影（体积感）+ 朝向太阳一侧暖色银边
     cloudCluster = (
       key: number,
@@ -234,31 +233,68 @@ export default function TerrainProfile({
         </g>
       );
     },
-    // 分层云带：云高(km)驱动仰角带；高云低云量走卷云丝缕(wisp)，高云量走层云带；受光状态同步取景界面
-    cloudLayer = (
+    // CloudSat 式垂直云柱：借鉴 CPR 毫米波雷达的垂直剖面观测——
+    // 云不再是一层皮，而是有云底/云顶/厚度的垂直柱。
+    // 每层按 profile 的 base→top 绘制柱体，顶部按水相着色，
+    // 降水云在柱底垂下雨幡，柱顶标注 CloudSat 2B-CLDCLASS 云型。
+    cloudColumn = (
       layer: "high" | "mid" | "low",
-      coverPct: number,
+      prof: CloudLayerProfile,
       seed: number,
-      wisp = false,
       lit = true,
     ) => {
-      if (coverPct <= 0) return null;
-      const cfg =
-        layer === "high"
-          ? { base: bandBase(2), amp: 3, filt: "url(#cldHi)", fill: "url(#cldGradHi)", ry: 3.4, ryAmp: 2.6, n: 7 }
-          : layer === "mid"
-            ? { base: bandBase(1), amp: 5, filt: "url(#cldMi)", fill: "url(#cldGradMi)", ry: 5.2, ryAmp: 3.4, n: 8 }
-            : { base: bandBase(0), amp: 7, filt: "url(#cldLo)", fill: "url(#cldGradLo)", ry: 7, ryAmp: 4.6, n: 8 };
-      const count = Math.max(
+      if (prof.cover <= 0) return null;
+      const baseY = Y(cloudElev(prof.base)),
+        topY = Y(cloudElev(prof.top)),
+        colH = Math.max(10, baseY - topY),
+        cfg =
+          layer === "high"
+            ? { filt: "url(#cldHi)", fill: "url(#cldGradHi)", ry: 3.4, ryAmp: 2.6, n: 7 }
+            : layer === "mid"
+              ? { filt: "url(#cldMi)", fill: "url(#cldGradMi)", ry: 5.2, ryAmp: 3.4, n: 8 }
+              : { filt: "url(#cldLo)", fill: "url(#cldGradLo)", ry: 7, ryAmp: 4.6, n: 8 },
+        wisp =
+          prof.genus === "cirrus" ||
+          prof.genus === "cirrostratus" ||
+          prof.genus === "cirrocumulus",
+        count = Math.max(
           2,
-          Math.round((wisp ? cfg.n * 0.72 : cfg.n) * (0.55 + (coverPct / 100) * 0.55)),
+          Math.round((wisp ? cfg.n * 0.72 : cfg.n) * (0.55 + (prof.cover / 100) * 0.55)),
         ),
-        op = (0.3 + (coverPct / 100) * 0.55) * (lit ? 1 : 0.5);
+        op = (0.3 + (prof.cover / 100) * 0.55) * (lit ? 1 : 0.5),
+        // 水相着色：冰白 / 混合灰 / 液态暗
+        phaseFill =
+          prof.phase === "ice"
+            ? "rgba(232,240,248,0.5)"
+            : prof.phase === "mixed"
+              ? "rgba(205,214,222,0.42)"
+              : "rgba(158,176,189,0.38)";
       const items: React.ReactNode[] = [];
+      // 1) 垂直柱体：云底到云顶的 CloudSat 剖面柱（半透明，带模糊）
+      items.push(
+        <rect
+          key="col"
+          x={padL}
+          y={topY}
+          width={plotW}
+          height={colH}
+          rx={7}
+          fill={phaseFill}
+          opacity={lit ? 1 : 0.5}
+          filter="url(#cldMi)"
+        />,
+      );
+      // 2) 云泡簇：沿柱体高度分布，顶部更密（云顶凸起）
       for (let i = 0; i < count; i++) {
         const t = (i + 0.5) / count,
-          cx = padL + t * plotW + (noise(t * 9.3 + seed, 3.1) - 0.5) * 30,
-          cy = cfg.base + Math.sin(t * 6.28 + seed * 1.7) * cfg.amp + (noise(t * 13.7 + seed, 8.9) - 0.5) * 7,
+          cx =
+            padL +
+            t * plotW +
+            (noise(t * 9.3 + seed, 3.1) - 0.5) * 30,
+          cy =
+            topY +
+            colH * (0.3 + 0.55 * noise(t * 5.7 + seed, 1.3)) +
+            Math.sin(t * 6.28 + seed * 1.7) * 3,
           rx = (plotW / count) * (0.66 + noise(t * 7.1 + seed, 5.5) * 0.55),
           ry = (wisp ? cfg.ry * 0.6 : cfg.ry) + noise(t * 11.3 + seed, 1.7) * cfg.ryAmp,
           dist = Math.abs(cx - sunX) / plotW,
@@ -270,11 +306,38 @@ export default function TerrainProfile({
           </g>,
         );
       }
-      // 高云附加纤薄丝缕：卷云感（wisp 时更密）
+      // 3) 降水雨幡：降水云在云底下方垂落（雪为虚线、雨为实线）
+      if (prof.precip !== "none") {
+        const sn = 4 + Math.round(prof.cover / 25);
+        for (let s = 0; s < sn; s++) {
+          const x0 =
+              padL +
+              ((s + 0.5) / sn) * plotW +
+              (noise(s * 3.7, seed) - 0.5) * 24,
+            len = Math.min(46, colH * (0.5 + noise(s * 7.1, seed + 2) * 0.5)),
+            sway = (noise(s * 9.3, seed + 5) - 0.5) * 8;
+          items.push(
+            <path
+              key={`p${s}`}
+              d={`M${x0},${baseY} q${sway},${len * 0.5} ${sway * 1.6},${len}`}
+              stroke={
+                prof.precip === "snow"
+                  ? "rgba(220,232,240,0.5)"
+                  : "rgba(120,140,160,0.45)"
+              }
+              strokeWidth={1.1}
+              strokeDasharray={prof.precip === "snow" ? "2 2" : undefined}
+              fill="none"
+              opacity={lit ? 0.55 : 0.3}
+            />,
+          );
+        }
+      }
+      // 4) 高云附加纤薄丝缕：卷云感（wisp 时更密）
       if (layer === "high") {
         const sn = wisp ? 6 : 3;
         for (let s = 0; s < sn; s++) {
-          const y0 = cfg.base + (s - 1) * 5 + (noise(s * 4.1, 9.1) - 0.5) * 4,
+          const y0 = topY + colH * (0.2 + noise(s * 4.1, 9.1) * 0.6),
             x0 = padL + noise(s * 8.3, 2.2) * plotW * 0.35,
             len = plotW * (0.3 + noise(s * 3.7, 6.4) * 0.32);
           items.push(
@@ -289,6 +352,35 @@ export default function TerrainProfile({
             />,
           );
         }
+      }
+      // 5) CloudSat 云型标注：柱顶上方（云型 + 云底–云顶高度）
+      if (prof.cover >= 18) {
+        const labelX =
+          padL + plotW * 0.5 + (noise(seed, 4.2) - 0.5) * plotW * 0.4;
+        items.push(
+          <g key="lab">
+            <text
+              x={labelX}
+              y={Math.max(12, topY - 4)}
+              fill={lit ? "#e8f0f4" : "#9fb0b8"}
+              fontSize="9"
+              textAnchor="middle"
+              opacity={0.85}
+            >
+              {prof.type}
+            </text>
+            <text
+              x={labelX}
+              y={Math.max(22, topY - 4 + 9)}
+              fill="#7f9390"
+              fontSize="7.5"
+              textAnchor="middle"
+              opacity={0.7}
+            >
+              {prof.base.toFixed(1)}–{prof.top.toFixed(1)}km
+            </text>
+          </g>,
+        );
       }
       return (
         <g key={layer} opacity={op}>
@@ -431,10 +523,34 @@ export default function TerrainProfile({
           </text>
         </g>
       ))}
-      {/* 天空云层：低/中/高云带，云高驱动仰角位置、云量驱动簇密度与不透明度；高云低云量走卷云丝缕、受光状态联动取景界面 */}
-      {visible[2] && cloudHigh > 0 && cloudLayer("high", cloudHigh, 11, cloudHigh <= 62, illum?.[2])}
-      {visible[1] && cloudMid > 0 && cloudLayer("mid", cloudMid, 23, false, illum?.[1])}
-      {visible[0] && cloudLow > 0 && cloudLayer("low", cloudLow, 37, false, illum?.[0])}
+      {/* CloudSat 云剖面：低/中/高云垂直柱，云底/云顶/厚度驱动仰角带，
+          水相着色、降水雨幡、2B-CLDCLASS 云型标注；受光状态联动取景界面 */}
+      {(() => {
+        const profOf = (i: number): CloudLayerProfile =>
+          profile?.[i] ?? {
+            genus: (["stratocumulus", "altocumulus", "cirrus"] as const)[i],
+            type: ["层积云 Sc", "高积云 Ac", "卷云 Ci"][i],
+            base: Math.max(0.5, (heights?.[i] ?? [1.5, 5.5, 10][i]) - 0.4),
+            top: (heights?.[i] ?? [1.5, 5.5, 10][i]) + 0.8,
+            thickness: 1.2,
+            phase: i === 2 ? "ice" : i === 1 ? "mixed" : "liquid",
+            precip: "none",
+            cover: [cloudLow, cloudMid, cloudHigh][i],
+          };
+        return (
+          <>
+            {visible[2] &&
+              cloudHigh > 0 &&
+              cloudColumn("high", profOf(2), 11, illum?.[2])}
+            {visible[1] &&
+              cloudMid > 0 &&
+              cloudColumn("mid", profOf(1), 23, illum?.[1])}
+            {visible[0] &&
+              cloudLow > 0 &&
+              cloudColumn("low", profOf(0), 37, illum?.[0])}
+          </>
+        );
+      })()}
       <line
         x1={padL}
         y1={Y(0)}
@@ -552,6 +668,32 @@ export default function TerrainProfile({
         {mode === "sunset" ? "日落" : "日出"} · 云 低{Math.round(cloudLow)}
         % 中{Math.round(cloudMid)}% 高{Math.round(cloudHigh)}%
       </text>
+      {/* CloudSat 云剖面图例：水相 + 降水 */}
+      <g>
+        <text x={padL} y={H - 10} fill="#7f9390" fontSize="8">
+          CloudSat 云剖面
+        </text>
+        <rect x={padL + 76} y={H - 14} width={9} height={9} rx={2} fill="rgba(232,240,248,0.55)" />
+        <text x={padL + 89} y={H - 6} fill="#9db0ac" fontSize="8">
+          冰相
+        </text>
+        <rect x={padL + 116} y={H - 14} width={9} height={9} rx={2} fill="rgba(205,214,222,0.5)" />
+        <text x={padL + 129} y={H - 6} fill="#9db0ac" fontSize="8">
+          混合
+        </text>
+        <rect x={padL + 156} y={H - 14} width={9} height={9} rx={2} fill="rgba(158,176,189,0.5)" />
+        <text x={padL + 169} y={H - 6} fill="#9db0ac" fontSize="8">
+          液态
+        </text>
+        <line x1={padL + 200} y1={H - 9} x2={padL + 216} y2={H - 9} stroke="rgba(120,140,160,0.5)" strokeWidth="1.4" />
+        <text x={padL + 220} y={H - 6} fill="#9db0ac" fontSize="8">
+          雨
+        </text>
+        <line x1={padL + 236} y1={H - 9} x2={padL + 252} y2={H - 9} stroke="rgba(220,232,240,0.5)" strokeWidth="1.4" strokeDasharray="2 2" />
+        <text x={padL + 256} y={H - 6} fill="#9db0ac" fontSize="8">
+          雪
+        </text>
+      </g>
     </svg>
   );
 }
