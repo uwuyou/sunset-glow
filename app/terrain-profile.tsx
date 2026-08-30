@@ -353,35 +353,7 @@ export default function TerrainProfile({
           );
         }
       }
-      // 5) CloudSat 云型标注：柱顶上方（云型 + 云底–云顶高度）
-      if (prof.cover >= 18) {
-        const labelX =
-          padL + plotW * 0.5 + (noise(seed, 4.2) - 0.5) * plotW * 0.4;
-        items.push(
-          <g key="lab">
-            <text
-              x={labelX}
-              y={Math.max(12, topY - 4)}
-              fill={lit ? "#e8f0f4" : "#9fb0b8"}
-              fontSize="9"
-              textAnchor="middle"
-              opacity={0.85}
-            >
-              {prof.type}
-            </text>
-            <text
-              x={labelX}
-              y={Math.max(22, topY - 4 + 9)}
-              fill="#7f9390"
-              fontSize="7.5"
-              textAnchor="middle"
-              opacity={0.7}
-            >
-              {prof.base.toFixed(1)}–{prof.top.toFixed(1)}km
-            </text>
-          </g>,
-        );
-      }
+      // 5) 云柱顶部微光：CloudSat 剖面感（无文字，纯视觉）
       return (
         <g key={layer} opacity={op}>
           {items}
@@ -668,32 +640,6 @@ export default function TerrainProfile({
         {mode === "sunset" ? "日落" : "日出"} · 云 低{Math.round(cloudLow)}
         % 中{Math.round(cloudMid)}% 高{Math.round(cloudHigh)}%
       </text>
-      {/* CloudSat 云剖面图例：水相 + 降水 */}
-      <g>
-        <text x={padL} y={H - 10} fill="#7f9390" fontSize="8">
-          CloudSat 云剖面
-        </text>
-        <rect x={padL + 76} y={H - 14} width={9} height={9} rx={2} fill="rgba(232,240,248,0.55)" />
-        <text x={padL + 89} y={H - 6} fill="#9db0ac" fontSize="8">
-          冰相
-        </text>
-        <rect x={padL + 116} y={H - 14} width={9} height={9} rx={2} fill="rgba(205,214,222,0.5)" />
-        <text x={padL + 129} y={H - 6} fill="#9db0ac" fontSize="8">
-          混合
-        </text>
-        <rect x={padL + 156} y={H - 14} width={9} height={9} rx={2} fill="rgba(158,176,189,0.5)" />
-        <text x={padL + 169} y={H - 6} fill="#9db0ac" fontSize="8">
-          液态
-        </text>
-        <line x1={padL + 200} y1={H - 9} x2={padL + 216} y2={H - 9} stroke="rgba(120,140,160,0.5)" strokeWidth="1.4" />
-        <text x={padL + 220} y={H - 6} fill="#9db0ac" fontSize="8">
-          雨
-        </text>
-        <line x1={padL + 236} y1={H - 9} x2={padL + 252} y2={H - 9} stroke="rgba(220,232,240,0.5)" strokeWidth="1.4" strokeDasharray="2 2" />
-        <text x={padL + 256} y={H - 6} fill="#9db0ac" fontSize="8">
-          雪
-        </text>
-      </g>
     </svg>
   );
 }

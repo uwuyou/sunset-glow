@@ -2047,12 +2047,14 @@ export default function Home() {
               {[0, 3, 6, 9, 12].map((km) => {
                 const yy = 8 + ((13 - km) / 13) * 90;
                 return (
-                  <g key={km}>
-                    <line x1="0" y1={yy} x2="300" y2={yy} stroke="rgba(120,140,150,0.12)" />
-                    <text x="2" y={yy + 3} fill="#7f9390" fontSize="7">
-                      {km}
-                    </text>
-                  </g>
+                  <line
+                    key={km}
+                    x1="0"
+                    y1={yy}
+                    x2="300"
+                    y2={yy}
+                    stroke="rgba(120,140,150,0.12)"
+                  />
                 );
               })}
               {cloudProfileData.map((p, i) => {
@@ -2084,16 +2086,10 @@ export default function Home() {
                       />
                     )}
                     <rect x={cx - 16} y={topY} width="32" height={colH} rx="4" fill={fill} />
-                    <text x={cx} y={baseY + 14} fill="#9db0ac" fontSize="7" textAnchor="middle">
-                      {p.type}
-                    </text>
                   </g>
                 );
               })}
               <line x1="0" y1={98} x2="300" y2={98} stroke="rgba(255,214,160,0.35)" strokeDasharray="3 3" />
-              <text x="300" y="111" fill="#7f9390" fontSize="7" textAnchor="end">
-                高度 km
-              </text>
             </svg>
           </div>
           <div className="source-note">
