@@ -35,6 +35,12 @@ import { HISTORY_DAYS, forecastUpdateAt, sceneUrls, nextSunUrl, sunSourceMeta } 
 import { highCloudPlan, totalHazePlan } from "./cloud-render";
 import { sunDiskStats, sunTintAlpha } from "./sun-image";
 import { cirrusCount, deckThreshold } from "./cloud-deck";
+import {
+  classifyGenus,
+  GENUS_LABEL,
+  GENUS_MORPHOLOGY,
+  type CloudMorphology,
+} from "./cloud-genus";
 
 type Mode = "dawn" | "sunset";
 type Solar = { altitude: number; azimuth: number };
@@ -451,6 +457,8 @@ function Scene({
   viewBearing,
   scenario,
   wind500,
+  cape,
+  precipitation,
   aod,
   visibilityKm,
   illumination,
@@ -471,6 +479,8 @@ function Scene({
   viewBearing: number;
   scenario: string;
   wind500: number;
+  cape: number;
+  precipitation: number;
   aod: number;
   visibilityKm: number;
   illumination: boolean[];
@@ -752,6 +762,7 @@ function Scene({
         amount: number,
         tone: number[],
         sunlit: boolean,
+        stretch = 1,
       ) => {
         x.save();
         const lines = cirrusCount(amount);
@@ -766,9 +777,9 @@ function Scene({
           x.bezierCurveTo(
             px - 18,
             yy - 18,
-            px + 54 + wind500 * 1.5,
+            px + 54 * stretch + wind500 * 1.5 * stretch,
             yy + 16,
-            px + 132 + wind500 * 2.3,
+            px + 132 * stretch + wind500 * 2.3 * stretch,
             yy - 9 + n(i + 3) * 17,
           );
           x.stroke();
@@ -782,6 +793,7 @@ function Scene({
         scale: number,
         low = false,
         sunlit = false,
+        morph?: CloudMorphology,
       ) => {
         const ow = 224,
           oh = low ? 86 : 64,
@@ -828,22 +840,33 @@ function Scene({
           bright = mix(tone, [255, 225, 170], sunlit ? 0.46 : 0.08),
           shade = mix(tone, [27, 39, 56], low ? 0.56 : 0.38),
           threshold = deckThreshold(amount),
-          flow = drift * (low ? 0.011 : 0.016);
+          flow = drift * (low ? 0.011 : 0.016),
+          // 云属形态配方：未指定时回退到基准配方（等价旧行为）。
+          m: CloudMorphology = morph ?? {
+            perlinMix: 0.7,
+            freq: 1,
+            erosionMul: 1,
+            verticalExp: low ? 0.72 : 1.3,
+            anisotropy: 1,
+            alphaMul: 1,
+          };
         for (let py = 0; py < oh; py++)
           for (let px = 0; px < ow; px++) {
-            const u = (px / ow) * (low ? 5.6 : 7.4) + flow,
-              v = (py / oh) * (low ? 2.4 : 3.3),
+            const u =
+                ((px / ow) * (low ? 5.6 : 7.4) * m.freq) / m.anisotropy + flow,
+              v = (py / oh) * (low ? 2.4 : 3.3) * m.freq,
               perlin = fbm(u, v),
               cellular =
                 1 -
                 worley(u * (low ? 2.1 : 2.8) + 7, v * (low ? 2.1 : 2.8) - 5),
-              // Nubis式双层密度：Perlin-FBM 定主体，Worley 侵蚀云缘并制造孔洞。
-              shape = perlin * 0.7 + cellular * 0.3,
+              // 云属配方：Perlin 定平滑主体，Worley 按权重制造团块/孔洞。
+              shape = perlin * m.perlinMix + cellular * (1 - m.perlinMix),
               height01 = py / oh,
-              vertical = low
-                ? Math.pow(Math.sin(Math.PI * height01), 0.72)
-                : Math.pow(Math.sin(Math.PI * height01), 1.3),
-              erosion = worley(u * 5.7 - 14, v * 5.7 + 9) * (low ? 0.17 : 0.24),
+              vertical = Math.pow(Math.sin(Math.PI * height01), m.verticalExp),
+              erosion =
+                worley(u * 5.7 - 14, v * 5.7 + 9) *
+                (low ? 0.17 : 0.24) *
+                m.erosionMul,
               density =
                 clamp((shape - erosion - threshold) * 5.2) *
                 clamp(vertical * 1.7),
@@ -901,6 +924,24 @@ function Scene({
       const highY = cloudY(heights[2] || 10),
         midY = cloudY(heights[1] || 5.5),
         lowY = cloudY(heights[0] || 1.5);
+      // 云属识别：用 CAPE/降水/高空风把三层云量映射到《国际云图》云属，
+      // 再取出对应的形态配方（噪声混合、拉伸、侵蚀、厚度），驱动纹理渲染。
+      const coverTriple: [number, number, number] = [cover[0], cover[1], cover[2]],
+        heightTriple: [number, number, number] = [
+          heights[0],
+          heights[1],
+          heights[2],
+        ],
+        genus = classifyGenus({
+          cape,
+          precipitation,
+          wind: wind500,
+          cover: coverTriple,
+          heights: heightTriple,
+        });
+      const lowMorph = GENUS_MORPHOLOGY[genus.low],
+        midMorph = GENUS_MORPHOLOGY[genus.mid],
+        highMorph = GENUS_MORPHOLOGY[genus.high];
       if (visible[2]) {
         const hp = highCloudPlan(cover[2]);
         if (hp.mode === "deck")
@@ -911,14 +952,22 @@ function Scene({
             0.55,
             false,
             illumination[2],
+            highMorph,
           );
-        else cirrus(highY, cover[2], highTone, illumination[2]);
+        else
+          cirrus(
+            highY,
+            cover[2],
+            highTone,
+            illumination[2],
+            Math.max(1, highMorph.anisotropy),
+          );
       }
       if (visible[1]) {
-        texturedDeck(midY, cover[1], midTone, 0.78, false, illumination[1]);
+        texturedDeck(midY, cover[1], midTone, 0.78, false, illumination[1], midMorph);
       }
       if (visible[0])
-        texturedDeck(lowY, cover[0], lowTone, 1.18, true, illumination[0]);
+        texturedDeck(lowY, cover[0], lowTone, 1.18, true, illumination[0], lowMorph);
       const totalCover = 100 * (1 - (1-cover[0]/100)*(1-cover[1]/100)*(1-cover[2]/100)),
         totalHaze = totalHazePlan(totalCover);
       if (totalHaze.visible) {
@@ -1418,6 +1467,13 @@ export default function Home() {
     wind500 = Number(
       comparisonHourly?.wind_speed_500hPa?.[comparisonIdx] || 20,
     ),
+    genus = classifyGenus({
+      cape,
+      precipitation,
+      wind: wind500,
+      cover: [cover[0], cover[1], cover[2]],
+      heights: [effectiveHeights[0], effectiveHeights[1], effectiveHeights[2]],
+    }),
     deterministicProbability = Math.min(
       99,
       Math.round(
@@ -1508,9 +1564,9 @@ export default function Home() {
               ? "低云遮挡型"
               : "云洞漏光型",
     cloudKinds = [
-      cover[0] > 62 ? "层积云 Sc" : "碎层云 St",
-      scenario === "中云层状型" || cover[1] > 68 ? "高层云 As" : "高积云 Ac",
-      cover[2] > 62 ? "卷层云 Cs" : "卷云 Ci",
+      GENUS_LABEL[genus.low],
+      GENUS_LABEL[genus.mid],
+      GENUS_LABEL[genus.high],
     ],
     scan = event
       ? Array.from({ length: 25 }, (_, i) => {
@@ -1824,6 +1880,8 @@ export default function Home() {
               viewBearing={bearing}
               scenario={scenario}
               wind500={wind500}
+              cape={cape}
+              precipitation={precipitation}
               aod={aod}
               visibilityKm={visibility / 1000}
               illumination={illum}
