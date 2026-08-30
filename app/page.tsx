@@ -34,6 +34,7 @@ import TerrainProfile from "./terrain-profile";
 import { HISTORY_DAYS, forecastUpdateAt, sceneUrls, nextSunUrl, sunSourceMeta } from "./scene-urls";
 import { highCloudPlan, totalHazePlan } from "./cloud-render";
 import { sunDiskStats, sunTintAlpha } from "./sun-image";
+import { cirrusCount, deckThreshold } from "./cloud-deck";
 
 type Mode = "dawn" | "sunset";
 type Solar = { altitude: number; azimuth: number };
@@ -753,9 +754,10 @@ function Scene({
         sunlit: boolean,
       ) => {
         x.save();
-        x.globalAlpha = (sunlit ? 0.18 : 0.1) + amount / 350;
+        const lines = cirrusCount(amount);
+        x.globalAlpha = lines ? (sunlit ? 0.18 : 0.1) + amount / 350 : 0;
         x.strokeStyle = `rgb(${mix(tone, [255, 236, 197], sunlit ? 0.55 : 0.12).join(",")})`;
-        for (let i = 0; i < Math.round(16 + amount / 5); i++) {
+        for (let i = 0; i < lines; i++) {
           const px = wrap(i * 97 + drift * 0.55),
             yy = y - 38 + n(i) * 74;
           x.lineWidth = 0.65 + n(i + 2) * 2.2;
@@ -825,7 +827,7 @@ function Scene({
           },
           bright = mix(tone, [255, 225, 170], sunlit ? 0.46 : 0.08),
           shade = mix(tone, [27, 39, 56], low ? 0.56 : 0.38),
-          threshold = 0.59 - Math.min(0.34, amount / 260),
+          threshold = deckThreshold(amount),
           flow = drift * (low ? 0.011 : 0.016);
         for (let py = 0; py < oh; py++)
           for (let px = 0; px < ow; px++) {
