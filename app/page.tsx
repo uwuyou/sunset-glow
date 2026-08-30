@@ -898,6 +898,156 @@ function Scene({
         }
         x.restore();
       };
+      // 积雨云 Cb：高耸花椰菜状塔身 + 薄广铁砧云顶 + 垂落雨幡 + 乳状云下缘。
+      // CAPE/降水判定为对流云时替代通用纹理云层，呈现雷暴云顶天立地的形态。
+      const cumulonimbus = (
+        baseY: number,
+        anvilY: number,
+        amount: number,
+        tone: number[],
+        sunlit: boolean,
+      ) => {
+        const a = clamp(amount / 100);
+        if (a <= 0) return;
+        const cx = wrap(sunlit ? sx : w / 2 + look, 320),
+          towerH = baseY - anvilY,
+          baseW = w * (0.1 + a * 0.09),
+          anvilW = w * (0.46 + a * 0.24),
+          top = anvilY + Math.max(12, towerH * 0.05),
+          anvilH = Math.max(13, towerH * 0.055),
+          dark = mix(tone, [28, 34, 50], sunlit ? 0.74 : 0.52),
+          glow = mix(tone, [255, 216, 150], sunlit ? 0.6 : 0.13),
+          topGlow = mix(glow, [255, 238, 190], 0.35);
+        x.save();
+        // 1) 雨幡：从云底向下垂落的弥散丝缕，随高度渐隐、略带弯曲。
+        //    高空风（wind500）驱动丝缕整体顺风倾斜飘散，强对流时更为显著。
+        const windTilt = Math.min(0.95, (wind500 || 0) * 0.02);
+        for (let i = 0; i < 14; i++) {
+          const rx = cx + (n(i * 3.1 + 1) - 0.5) * baseW * 2.6,
+            len = towerH * (0.55 + n(i * 5.7 + 3) * 0.75),
+            sway = (n(i * 7.9 + 6) - 0.5) * len * 0.55,
+            drift = windTilt * len * (0.55 + n(i * 11.3) * 0.5),
+            half = baseW * (0.05 + n(i * 4.3 + 2) * 0.085),
+            g = x.createLinearGradient(0, baseY, 0, baseY + len);
+          g.addColorStop(0, `rgba(${dark.join(",")},${0.42 + n(i * 2.9) * 0.26})`);
+          g.addColorStop(0.55, `rgba(${dark.join(",")},${0.17 + n(i * 2.9) * 0.12})`);
+          g.addColorStop(1, `rgba(${dark.join(",")},0)`);
+          x.globalAlpha = (0.22 + n(i * 6.1) * 0.26) * a;
+          x.fillStyle = g;
+          x.beginPath();
+          x.moveTo(rx - half, baseY);
+          x.quadraticCurveTo(
+            rx - half * 0.4 + drift * 0.45,
+            baseY + len * 0.55 + sway,
+            rx + drift,
+            baseY + len,
+          );
+          x.quadraticCurveTo(
+            rx + half * 0.4 + drift * 0.45,
+            baseY + len * 0.55 + sway,
+            rx + half,
+            baseY,
+          );
+          x.closePath();
+          x.fill();
+        }
+        // 2) 塔状主体：连续堆叠的云泡（花椰菜状），加垂直抖动避免规则层叠
+        for (let layer = 0; layer < 2; layer++) {
+          const off = layer ? 0.6 : 1,
+            isFront = layer === 1;
+          for (let i = 0; i < 20; i++) {
+            const t = i / 19,
+              jit = (n(i * 7.7 + layer * 13) - 0.5) * towerH * 0.06,
+              yy = baseY - towerH * t + jit,
+              bulge = 0.5 + 0.9 * Math.sin(Math.PI * Math.min(1, t * 1.7)),
+              ww = (baseW * (0.45 + bulge) + anvilW * 0.16 * t) * off,
+              rr = 0.65 + n(i * 3.1 + layer * 5) * 0.55,
+              lit = isFront ? (sunlit ? 0.32 + 0.42 * t : 0.1) : 0.03,
+              col = isFront
+                ? mix(dark, glow, lit)
+                : mix(dark, [16, 20, 32], 0.45);
+            x.globalAlpha = (isFront ? 0.94 : 0.82) * a;
+            x.fillStyle = `rgb(${col.join(",")})`;
+            x.beginPath();
+            x.ellipse(
+              cx + (n(i * 5.1 + layer * 9 + 4) - 0.5) * ww * 0.7,
+              yy,
+              ww * rr,
+              Math.max(10, towerH * 0.12),
+              0,
+              0,
+              Math.PI * 2,
+            );
+            x.fill();
+          }
+        }
+        // 3) 薄广铁砧云顶：扁平云砧大幅向两侧铺展
+        x.globalAlpha = 0.95 * a;
+        x.fillStyle = `rgb(${topGlow.join(",")})`;
+        x.beginPath();
+        x.moveTo(cx - anvilW, top);
+        x.quadraticCurveTo(
+          cx - anvilW * 0.45,
+          top - anvilH * 1.5,
+          cx,
+          top - anvilH * 0.4,
+        );
+        x.quadraticCurveTo(
+          cx + anvilW * 0.45,
+          top - anvilH * 1.5,
+          cx + anvilW,
+          top,
+        );
+        x.quadraticCurveTo(
+          cx + anvilW * 0.6,
+          top + anvilH * 1.1,
+          cx + anvilW * 0.2,
+          top + anvilH * 0.55,
+        );
+        x.quadraticCurveTo(cx, top + anvilH * 1.2, cx - anvilW * 0.2, top + anvilH * 0.55);
+        x.quadraticCurveTo(
+          cx - anvilW * 0.6,
+          top + anvilH * 1.1,
+          cx - anvilW,
+          top,
+        );
+        x.fill();
+        // 云砧下缘：乳状云（mammatus），稀疏分布在大片阴面
+        x.globalAlpha = 0.5 * a;
+        x.fillStyle = `rgb(${dark.join(",")})`;
+        for (let i = 0; i < 12; i++) {
+          const bx = cx + (i / 11 - 0.5) * anvilW * 1.8,
+            by = top + anvilH * (0.6 + n(i * 6.2) * 1.1);
+          x.beginPath();
+          x.ellipse(bx, by, anvilW * 0.12, anvilH * 0.7, 0, 0, Math.PI);
+          x.fill();
+        }
+        // 4) 上冲云塔：云砧顶部的残留鼓包
+        for (let i = 0; i < 6; i++) {
+          const bx = cx + (i - 2.5) * anvilW * 0.38 + n(i * 9 + 2) * 24,
+            by = top - anvilH * (0.4 + n(i * 3 + 7) * 1.3);
+          x.globalAlpha = 0.85 * a;
+          x.fillStyle = `rgb(${topGlow.join(",")})`;
+          x.beginPath();
+          x.ellipse(
+            bx,
+            by,
+            anvilW * 0.11,
+            anvilH * (0.7 + n(i) * 0.9),
+            0,
+            0,
+            Math.PI * 2,
+          );
+          x.fill();
+        }
+        // 5) 塔基暗面
+        x.globalAlpha = 0.4 * a;
+        x.fillStyle = `rgb(${dark.join(",")})`;
+        x.beginPath();
+        x.ellipse(cx, baseY - 4, baseW * 1.1, towerH * 0.08, 0, 0, Math.PI * 2);
+        x.fill();
+        x.restore();
+      };
       const strata = (
         y: number,
         amount: number,
@@ -942,7 +1092,11 @@ function Scene({
       const lowMorph = GENUS_MORPHOLOGY[genus.low],
         midMorph = GENUS_MORPHOLOGY[genus.mid],
         highMorph = GENUS_MORPHOLOGY[genus.high];
-      if (visible[2]) {
+      // 积雨云优先：低层判定为积雨云 Cb 时，用专属雷暴云形态（塔状+铁砧+雨幡）
+      // 覆盖整个垂直柱，替代通用的低/中/高纹理云层，避免叠画干扰。
+      const cbActive = visible[0] && genus.low === "cumulonimbus",
+        cbAnvilY = cloudY(Math.max(11, heights[2] || 10));
+      if (visible[2] && !cbActive) {
         const hp = highCloudPlan(cover[2]);
         if (hp.mode === "deck")
           texturedDeck(
@@ -963,11 +1117,19 @@ function Scene({
             Math.max(1, highMorph.anisotropy),
           );
       }
-      if (visible[1]) {
+      if (visible[1] && !(cbActive && genus.mid === "cumulonimbus")) {
         texturedDeck(midY, cover[1], midTone, 0.78, false, illumination[1], midMorph);
       }
-      if (visible[0])
+      if (visible[0] && !cbActive)
         texturedDeck(lowY, cover[0], lowTone, 1.18, true, illumination[0], lowMorph);
+      if (cbActive)
+        cumulonimbus(
+          lowY,
+          cbAnvilY,
+          Math.max(cover[0], cover[1]),
+          lowTone,
+          illumination[0] || illumination[1],
+        );
       const totalCover = 100 * (1 - (1-cover[0]/100)*(1-cover[1]/100)*(1-cover[2]/100)),
         totalHaze = totalHazePlan(totalCover);
       if (totalHaze.visible) {
@@ -1207,6 +1369,7 @@ export default function Home() {
     [lookOffset, setLookOffset] = useState(0),
     [sceneView, setSceneView] = useState<"view" | "profile">("view"),
     [visible, setVisible] = useState([true, true, true]),
+    [demoCb, setDemoCb] = useState(false),
     [dataPanel, setDataPanel] = useState(false),
     [data, setData] = useState<SceneData | null>(null),
     [loading, setLoading] = useState(true),
@@ -1317,37 +1480,41 @@ export default function Home() {
           0,
         )
       : 0,
-    cover = [
-      Number(hourly?.cloud_cover_low?.[idx] || 0),
-      Number(hourly?.cloud_cover_mid?.[idx] || 0),
-      Number(hourly?.cloud_cover_high?.[idx] || 0),
-    ],
+    cover = demoCb
+      ? [75, 55, 35]
+      : [
+          Number(hourly?.cloud_cover_low?.[idx] || 0),
+          Number(hourly?.cloud_cover_mid?.[idx] || 0),
+          Number(hourly?.cloud_cover_high?.[idx] || 0),
+        ],
     totalCloud = Math.round(
       100 * (1 - (1 - cover[0] / 100) * (1 - cover[1] / 100) * (1 - cover[2] / 100)),
     ),
-    visibility = Number(hourly?.visibility?.[idx] || 15000),
+    visibility = demoCb ? 12000 : Number(hourly?.visibility?.[idx] || 15000),
     stationElevation = Number(data?.weather.elevation || 500),
-    heights = [
-      Math.max(
-        0.5,
-        (Number(hourly?.geopotential_height_850hPa?.[idx] || 2000) -
-          stationElevation) /
-          1000,
-      ),
-      Math.max(
-        3,
-        (Number(hourly?.geopotential_height_500hPa?.[idx] || 6000) -
-          stationElevation) /
-          1000,
-      ),
-      Math.max(
-        7,
-        (Number(hourly?.geopotential_height_250hPa?.[idx] || 10800) -
-          stationElevation) /
-          1000,
-      ),
-    ],
-    aod = Number(hourly?.aerosol_optical_depth?.[idx] || 0.2),
+    heights = demoCb
+      ? [1.5, 6.2, 12]
+      : [
+          Math.max(
+            0.5,
+            (Number(hourly?.geopotential_height_850hPa?.[idx] || 2000) -
+              stationElevation) /
+              1000,
+          ),
+          Math.max(
+            3,
+            (Number(hourly?.geopotential_height_500hPa?.[idx] || 6000) -
+              stationElevation) /
+              1000,
+          ),
+          Math.max(
+            7,
+            (Number(hourly?.geopotential_height_250hPa?.[idx] || 10800) -
+              stationElevation) /
+              1000,
+          ),
+        ],
+    aod = demoCb ? 0.35 : Number(hourly?.aerosol_optical_depth?.[idx] || 0.2),
     pm25 = Number(hourly?.pm2_5?.[idx] || 0),
     scaleHeight = Math.max(
       0.5,
@@ -1460,13 +1627,13 @@ export default function Home() {
     modelSpread = Math.round(
       comparisonCover.reduce((s, v, i) => s + Math.abs(v - cover[i]), 0) / 3,
     ),
-    cape = Number(comparisonHourly?.cape?.[comparisonIdx] || 0),
-    precipitation = Number(
-      comparisonHourly?.precipitation?.[comparisonIdx] || 0,
-    ),
-    wind500 = Number(
-      comparisonHourly?.wind_speed_500hPa?.[comparisonIdx] || 20,
-    ),
+    cape = demoCb ? 1200 : Number(comparisonHourly?.cape?.[comparisonIdx] || 0),
+    precipitation = demoCb
+      ? 0.8
+      : Number(comparisonHourly?.precipitation?.[comparisonIdx] || 0),
+    wind500 = demoCb
+      ? 30
+      : Number(comparisonHourly?.wind_speed_500hPa?.[comparisonIdx] || 20),
     genus = classifyGenus({
       cape,
       precipitation,
@@ -1553,8 +1720,9 @@ export default function Home() {
         ),
       ),
     ),
-    scenario =
-      cape > 700
+    scenario = demoCb
+      ? "积雨云虚拟演示"
+      : cape > 700
         ? "对流云边缘型"
         : cover[2] > 58 && cover[1] < 48
           ? "高云幕型"
@@ -1790,6 +1958,18 @@ export default function Home() {
           <button className="location-btn" onClick={load}>
             <RefreshCw size={15} className={loading ? "spin" : ""} />
             {loading ? "正在读取真实数据" : "刷新实况/预报"}
+          </button>
+          <button
+            className={`demo-btn ${demoCb ? "active" : ""}`}
+            onClick={() => {
+              setDemoCb((v) => !v);
+              setVisible([true, true, true]);
+              setSceneView("view");
+            }}
+            aria-pressed={demoCb}
+          >
+            <CloudSun size={15} />
+            {demoCb ? "积雨云演示中 · 点击退出" : "积雨云虚拟演示"}
           </button>
           <div className="data-clock">
             <span>当前 {clock === null ? "--:--:--" : new Date(clock).toLocaleTimeString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false })}</span>

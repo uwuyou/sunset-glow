@@ -563,6 +563,45 @@ select {
   background: rgba(239, 158, 98, 0.07);
   color: #efae7c;
 }
+.demo-btn {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 9px;
+  border: 1px solid rgba(126, 172, 226, 0.35);
+  background: rgba(94, 130, 186, 0.08);
+  color: #9cc2ea;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+  border-radius: 7px;
+  transition:
+    background 0.2s,
+    color 0.2s,
+    border-color 0.2s;
+}
+.demo-btn:hover {
+  background: rgba(94, 130, 186, 0.16);
+  color: #cfe2f7;
+}
+.demo-btn.active {
+  border-color: rgba(249, 130, 108, 0.5);
+  background: rgba(249, 130, 108, 0.12);
+  color: #f5a795;
+  animation: demo-pulse 1.6s ease-in-out infinite;
+}
+@keyframes demo-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(249, 130, 108, 0);
+  }
+  50% {
+    box-shadow: 0 0 0 4px rgba(249, 130, 108, 0.16);
+  }
+}
 .divider {
   height: 1px;
   background: var(--line);
@@ -1189,6 +1228,7 @@ select {
   }
   .map-pick-btn,
   .location-btn,
+  .demo-btn,
   .smart-actions button {
     min-height: 44px;
   }
