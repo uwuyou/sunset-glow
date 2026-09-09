@@ -131,22 +131,25 @@ export function sampleCloudDensity(
   let density = baseCloud * Math.max(0.08, dhg);
 
   // 5) 覆盖度控制：基于密度场分位数经验拟合的线性阈值。
-  //    阈值 ≈ 密度场的 (1-cov) 分位（0.85 为拟合系数），使渲染像素占比
-  //    近似覆盖度，同时保留云芯高密度、低覆盖度下也能看到成团云层。
-  //    旧公式 (density - cov)/(1 - cov) 与 (density - (1-cov))/cov
+  //    阈值 ≈ 密度场的 (1-cov) 分位（0.78 为拟合系数，经 cloud-sim3 标定），
+  //    使渲染像素占比接近覆盖度，同时保留云芯高密度、低覆盖度下也能看到
+  //    成团云层。旧公式 (density - cov)/(1 - cov) 与 (density - (1-cov))/cov
   //    在低覆盖度下要么压灭整片云、要么只剩极淡的边角，均已废弃。
-  const threshold = Math.max(0.02, 0.85 * (1 - cov));
+  //    注：0.85→0.78 下调是为抵消低密度云的半透明叠加带来的"视觉偏少"，
+  //    86% 覆盖度下填充率由 64~71% 提升至 72~93%，与分层云面板观感对齐。
+  const threshold = Math.max(0.02, 0.78 * (1 - cov));
   density = Math.max(
     0,
     Math.min(1, (density - threshold) / (1 - threshold)),
   );
 
   // 6) 高频细节（Worley 高 octave）扰动边缘
+  //    hfErode 0.25→0.16（标定）：减小高频侵蚀对边缘的削减，进一步补回云量
   const hfDetail =
     (1 - worley(x * 10, y * 10)) * 0.5 +
     (1 - worley(x * 20, y * 20)) * 0.3 +
     (1 - worley(x * 40, y * 40)) * 0.2;
-  density = Math.max(0, Math.min(1, (density - hfDetail * 0.25) / (1 - hfDetail * 0.25)));
+  density = Math.max(0, Math.min(1, (density - hfDetail * 0.16) / (1 - hfDetail * 0.16)));
 
   // 7) 低密度截断：避免雾状拖尾（阈值降低，保留更多边缘云）
   if (density < 0.012) {
