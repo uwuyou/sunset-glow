@@ -55,6 +55,17 @@ import { cloudTone, GENUS_TONE, calcOvercast } from "./cloud-color";
 import { withTimeout } from "./abort";
 import { rankCities, type CityRank } from "./cities";
 import {
+  rad,
+  deg,
+  destination,
+  outsideChina,
+  wgsToGcj,
+  gcjToWgs,
+  lonLatToWorld,
+  worldToLonLat,
+} from "./geo";
+import WorthMapDialog from "./worth-map";
+import {
   getPrimarySatellite,
   getSatelliteInfo,
   getSatelliteFrames,
@@ -141,8 +152,6 @@ async function searchPlace(q: string, signal?: AbortSignal): Promise<GeoResult[]
     timezone: r.timezone ? String(r.timezone) : undefined,
   }));
 }
-const rad = (v: number) => (v * Math.PI) / 180,
-  deg = (v: number) => (v * 180) / Math.PI;
 function solarPosition(date: Date, lat: number, lon: number): Solar {
   // 无效日期（如数据未加载的瞬时状态）回退为太阳在地平线下，避免 NaN 传导到云色/天空渐变
   if (!Number.isFinite(date.getTime())) return { altitude: -90, azimuth: 0 };
@@ -171,100 +180,6 @@ function fmtObsTime(t: string | null) {
 }
 function dip(heightKm: number) {
   return deg(Math.acos(6371 / (6371 + heightKm)));
-}
-function destination(lat: number, lon: number, bearing: number, km: number) {
-  const p1 = rad(lat),
-    l1 = rad(lon),
-    b = rad(bearing),
-    d = km / 6371;
-  const p2 = Math.asin(
-    Math.sin(p1) * Math.cos(d) + Math.cos(p1) * Math.sin(d) * Math.cos(b),
-  );
-  const l2 =
-    l1 +
-    Math.atan2(
-      Math.sin(b) * Math.sin(d) * Math.cos(p1),
-      Math.cos(d) - Math.sin(p1) * Math.sin(p2),
-    );
-  return [deg(p2), ((deg(l2) + 540) % 360) - 180];
-}
-function outsideChina(lat: number, lon: number) {
-  return lon < 72.004 || lon > 137.8347 || lat < 0.8293 || lat > 55.8271;
-}
-function gcjDelta(lat: number, lon: number) {
-  const a = 6378245,
-    ee = 0.006693421622965943,
-    x = lon - 105,
-    y = lat - 35;
-  let dLat =
-      -100 +
-      2 * x +
-      3 * y +
-      0.2 * y * y +
-      0.1 * x * y +
-      0.2 * Math.sqrt(Math.abs(x)),
-    dLon =
-      300 +
-      x +
-      2 * y +
-      0.1 * x * x +
-      0.1 * x * y +
-      0.1 * Math.sqrt(Math.abs(x));
-  dLat +=
-    ((20 * Math.sin(6 * x * Math.PI) + 20 * Math.sin(2 * x * Math.PI)) * 2) / 3;
-  dLat +=
-    ((20 * Math.sin(y * Math.PI) + 40 * Math.sin((y / 3) * Math.PI)) * 2) / 3;
-  dLat +=
-    ((160 * Math.sin((y / 12) * Math.PI) + 320 * Math.sin((y * Math.PI) / 30)) *
-      2) /
-    3;
-  dLon +=
-    ((20 * Math.sin(6 * x * Math.PI) + 20 * Math.sin(2 * x * Math.PI)) * 2) / 3;
-  dLon +=
-    ((20 * Math.sin(x * Math.PI) + 40 * Math.sin((x / 3) * Math.PI)) * 2) / 3;
-  dLon +=
-    ((150 * Math.sin((x / 12) * Math.PI) + 300 * Math.sin((x / 30) * Math.PI)) *
-      2) /
-    3;
-  const rLat = rad(lat),
-    magic = 1 - ee * Math.sin(rLat) ** 2,
-    root = Math.sqrt(magic);
-  return [
-    (dLat * 180) / (((a * (1 - ee)) / (magic * root)) * Math.PI),
-    (dLon * 180) / ((a / root) * Math.cos(rLat) * Math.PI),
-  ];
-}
-function wgsToGcj(lat: number, lon: number): [number, number] {
-  if (outsideChina(lat, lon)) return [lat, lon];
-  const [dLat, dLon] = gcjDelta(lat, lon);
-  return [lat + dLat, lon + dLon];
-}
-function gcjToWgs(lat: number, lon: number): [number, number] {
-  if (outsideChina(lat, lon)) return [lat, lon];
-  let wLat = lat,
-    wLon = lon;
-  for (let i = 0; i < 3; i++) {
-    const [gLat, gLon] = wgsToGcj(wLat, wLon);
-    wLat += lat - gLat;
-    wLon += lon - gLon;
-  }
-  return [wLat, wLon];
-}
-function lonLatToWorld(lon: number, lat: number, zoom: number) {
-  const size = 256 * 2 ** zoom,
-    clamped = Math.max(-85.05112878, Math.min(85.05112878, lat)),
-    sin = Math.sin(rad(clamped));
-  return {
-    x: ((lon + 180) / 360) * size,
-    y: (0.5 - Math.log((1 + sin) / (1 - sin)) / (4 * Math.PI)) * size,
-  };
-}
-function worldToLonLat(x: number, y: number, zoom: number) {
-  const size = 256 * 2 ** zoom,
-    lon = (x / size) * 360 - 180,
-    n = Math.PI - (2 * Math.PI * y) / size,
-    lat = deg(Math.atan(Math.sinh(n)));
-  return { lat, lon };
 }
 
 function AmapPicker({
@@ -1526,6 +1441,7 @@ export default function Home() {
     [cityRankLoading, setCityRankLoading] = useState(false),
     [cityRankError, setCityRankError] = useState(""),
     [cityRankSharing, setCityRankSharing] = useState(false),
+    [worthMapOpen, setWorthMapOpen] = useState(false),
     [shareReady, setShareReady] = useState(false),
     [searchQuery, setSearchQuery] = useState(""),
     [searchResults, setSearchResults] = useState<GeoResult[]>([]),
@@ -2244,6 +2160,18 @@ export default function Home() {
         .catch(() => setCityRankError("批量评分失败，请稍后重试"))
         .finally(() => setCityRankLoading(false));
     },
+    // 值得专程拍摄范围地图：以当前观测点为中心的网格评分地图
+    openWorthMap = () => {
+      setWorthMapOpen(true);
+    },
+    pickWorthPoint = (lat: number, lon: number) => {
+      setPlaying(false);
+      setMinute(60);
+      setCustomLocation({ lat, lon });
+      setPlace("地图选点");
+      setWorthMapOpen(false);
+      load();
+    },
     pickCity = (c: CityRank) => {
       setPlaying(false);
       setMinute(60);
@@ -2586,6 +2514,14 @@ export default function Home() {
           >
             <Trophy size={15} className={cityRankLoading ? "spin" : ""} />
             {cityRankLoading ? "评分计算中…" : "推荐拍摄城市"}
+          </button>
+          <button
+            className="location-btn"
+            style={{ marginTop: 6 }}
+            onClick={openWorthMap}
+          >
+            <MapPin size={15} />
+            值得专程拍摄范围
           </button>
           <div className="data-clock">
             <span>当前 {clock === null ? "--:--:--" : new Date(clock).toLocaleTimeString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false })}</span>
@@ -3710,6 +3646,14 @@ export default function Home() {
           setCustomLocation(point);
           setPlace("地图选点");
         }}
+      />
+      <WorthMapDialog
+        open={worthMapOpen}
+        onOpenChange={setWorthMapOpen}
+        center={loc}
+        date={new Date(`${selectedDate}T12:00:00+08:00`)}
+        mode={mode}
+        onPick={pickWorthPoint}
       />
     </main>
   );
