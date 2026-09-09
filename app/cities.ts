@@ -709,3 +709,85 @@ export async function rankCities(
     .filter((r) => r.score > 0) // 剔除完全无云/无拍摄价值城市
     .sort((a, b) => b.score - a.score);
 }
+
+// 地图网格评分结果：格点经纬度 + 与城市完全一致的拍摄价值评分
+export type GridRank = {
+  lat: number;
+  lon: number;
+  rank: CityRank;
+};
+
+// 网格评分：以 center 为中心、radiusDeg 为半径、stepDeg 为间距生成格点，
+// 逐批拉取 ECMWF + 空气质量（与 rankCities 相同的批量方式），
+// 完全复用 scoreCity 计算每个格点的拍摄价值，供"值得专程拍摄范围"地图叠加。
+export async function rankGrid(
+  center: { lat: number; lon: number },
+  radiusDeg: number,
+  stepDeg: number,
+  date: Date,
+  mode: "dawn" | "sunset",
+  signal?: AbortSignal,
+  onBatch?: (done: number, total: number) => void,
+): Promise<GridRank[]> {
+  const BATCH = 26;
+  const steps = Math.max(1, Math.round(radiusDeg / stepDeg));
+  const grid: City[] = [];
+  for (let i = -steps; i <= steps; i++) {
+    for (let j = -steps; j <= steps; j++) {
+      const lat = Math.round((center.lat + i * stepDeg) * 100) / 100,
+        lon = Math.round((center.lon + j * stepDeg) * 100) / 100;
+      if (lat < -84 || lat > 84) continue;
+      grid.push({
+        name: `格点 ${lat.toFixed(2)},${lon.toFixed(2)}`,
+        province: "地图网格",
+        lat,
+        lon,
+      });
+    }
+  }
+  const total = Math.ceil(grid.length / BATCH);
+  const result: GridRank[] = [];
+  const dateStr = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+  for (let k = 0; k < grid.length; k += BATCH) {
+    onBatch?.(k / BATCH + 1, total);
+    const batch = grid.slice(k, k + BATCH);
+    const lats = batch.map((c) => c.lat).join(","),
+      lons = batch.map((c) => c.lon).join(",");
+    const fcUrl = `https://api.open-meteo.com/v1/forecast?latitude=${lats}&longitude=${lons}&hourly=cloud_cover_low,cloud_cover_mid,cloud_cover_high,visibility,precipitation,cape,wind_speed_500hPa,geopotential_height_850hPa,geopotential_height_500hPa,geopotential_height_250hPa&start_date=${dateStr}&end_date=${dateStr}&timezone=Asia%2FShanghai`;
+    const airUrl = `https://air-quality-api.open-meteo.com/v1/air-quality?latitude=${lats}&longitude=${lons}&hourly=aerosol_optical_depth&start_date=${dateStr}&end_date=${dateStr}&timezone=Asia%2FShanghai`;
+    const [fc, aq] = await Promise.allSettled([
+      fetch(fcUrl, { signal: withTimeout(signal, 20000) }),
+      fetch(airUrl, { signal: withTimeout(signal, 20000) }),
+    ]);
+    if (fc.status !== "fulfilled") continue;
+    let wf: any = null;
+    try {
+      wf = await fc.value.json();
+    } catch {
+      continue;
+    }
+    const cityList: any[] = Array.isArray(wf) ? wf : [wf];
+    let airList: any[] = [];
+    if (aq.status === "fulfilled") {
+      try {
+        const airJson = await aq.value.json();
+        airList = Array.isArray(airJson) ? airJson : [airJson];
+      } catch {
+        /* ignore */
+      }
+    }
+    cityList.forEach((cityData, bi) => {
+      const city = batch[bi];
+      if (!city) return;
+      const w: Record<string, (number | string)[]> = cityData.hourly || {};
+      const airW: Record<string, (number | string)[]> =
+        airList[bi]?.hourly || {};
+      result.push({
+        lat: city.lat,
+        lon: city.lon,
+        rank: scoreCity(city, date, mode, w, airW, cityData.elevation || 0),
+      });
+    });
+  }
+  return result.sort((a, b) => b.rank.score - a.rank.score);
+}
