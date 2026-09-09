@@ -1,25 +1,38 @@
 "use client";
+// 静态托管标记（由 vite.static.config.ts 注入）：GitHub Pages 无 /api/scene 后端
+declare const __STATIC__: boolean;
 import { useEffect, useRef, useState } from "react";
 import {
   Activity,
   AlertTriangle,
+  ArrowDown,
+  ArrowUp,
   CalendarDays,
   Camera,
   ChevronLeft,
   ChevronRight,
   CloudSun,
+  CloudLightning,
   Compass,
   Database,
   Layers3,
   MapPin,
+  Maximize2,
   Mountain,
   Navigation,
   Pause,
   Play,
-  Radar,
   RefreshCw,
   Satellite,
+  Search,
+  Settings,
+  Share2,
   Sparkles,
+  Sunrise,
+  TrendingUp,
+  Trophy,
+  Wind,
+  X,
 } from "lucide-react";
 import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
@@ -31,18 +44,42 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { getPosition, getTimes } from "suncalc";
+import { toPng } from "html-to-image";
 import TerrainProfile from "./terrain-profile";
-import { HISTORY_DAYS, forecastUpdateAt, sceneUrls, nextSunUrl, sunSourceMeta } from "./scene-urls";
-import { highCloudPlan, totalHazePlan } from "./cloud-render";
-import { sunDiskStats, sunTintAlpha } from "./sun-image";
+import SunPathProfile from "./sun-path-profile";
+import CityCloudProfile from "./city-cloud-profile";
 import { cirrusCount, deckThreshold } from "./cloud-deck";
+import { classifyGenus, type CloudGenus } from "./cloud-genus";
+import { cloudProfile, type CloudLayerProfile } from "./cloud-profile";
+import { cloudTone, GENUS_TONE, calcOvercast } from "./cloud-color";
+import { withTimeout } from "./abort";
+import { rankCities, type CityRank } from "./cities";
 import {
-  classifyGenus,
-  GENUS_MORPHOLOGY,
-  type CloudGenus,
-  type CloudMorphology,
-} from "./cloud-genus";
-import { cloudProfile, GENUS_PROFILE, type CloudLayerProfile } from "./cloud-profile";
+  getPrimarySatellite,
+  getSatelliteInfo,
+  getSatelliteFrames,
+  type SatSource,
+  type SatelliteInfo,
+  type SatelliteFrame,
+} from "./satellite";
+
+// 给 Promise 加超时保护：超时抛错，避免分享/截图在部分设备上挂起导致按钮卡在"生成中"
+function withPromiseTimeout<T>(p: Promise<T>, ms: number, msg: string) {
+  return Promise.race([
+    p,
+    new Promise<never>((_, rej) => setTimeout(() => rej(new Error(msg)), ms)),
+  ]);
+}
+
+// 触发浏览器下载一个文件（File 是 Blob 子类）
+function downloadBlob(file: File) {
+  const url = URL.createObjectURL(file);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = file.name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
 
 type Mode = "dawn" | "sunset";
 type Solar = { altitude: number; azimuth: number };
@@ -62,10 +99,13 @@ type SceneData = {
     distances: number[];
     forecasts: { hourly: Record<string, (number | string)[]> }[];
   };
+  sunPath?: {
+    distances: number[];
+    forecasts: { hourly: Record<string, (number | string)[]> }[];
+  };
   comparison?: { hourly: Record<string, (number | string)[]> } | null;
-  satellite: string;
+  satellite: SatelliteInfo;
   updated: string;
-  modelUpdate: string;
 };
 const places = {
   "成都·天府广场": { lat: 30.657, lon: 104.066 },
@@ -73,9 +113,39 @@ const places = {
   "成都·龙泉山": { lat: 30.52, lon: 104.31 },
 };
 type PlaceKey = keyof typeof places | "地图选点";
+// 任意地名搜索：Open-Meteo Geocoding API 返回的候选地点
+type GeoResult = {
+  name: string;
+  latitude: number;
+  longitude: number;
+  country?: string;
+  admin1?: string;
+  admin2?: string;
+  timezone?: string;
+};
+async function searchPlace(q: string, signal?: AbortSignal): Promise<GeoResult[]> {
+  const url = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(
+    q,
+  )}&count=6&language=zh&format=json`;
+  const res = await fetch(url, { signal });
+  if (!res.ok) throw new Error(`geocoding ${res.status}`);
+  const json = await res.json();
+  const results: GeoResult[] = json?.results ?? [];
+  return results.map((r: Record<string, unknown>) => ({
+    name: String(r.name ?? q),
+    latitude: Number(r.latitude),
+    longitude: Number(r.longitude),
+    country: r.country ? String(r.country) : undefined,
+    admin1: r.admin1 ? String(r.admin1) : undefined,
+    admin2: r.admin2 ? String(r.admin2) : undefined,
+    timezone: r.timezone ? String(r.timezone) : undefined,
+  }));
+}
 const rad = (v: number) => (v * Math.PI) / 180,
   deg = (v: number) => (v * 180) / Math.PI;
 function solarPosition(date: Date, lat: number, lon: number): Solar {
+  // 无效日期（如数据未加载的瞬时状态）回退为太阳在地平线下，避免 NaN 传导到云色/天空渐变
+  if (!Number.isFinite(date.getTime())) return { altitude: -90, azimuth: 0 };
   const position = getPosition(date, lat, lon);
   return { altitude: position.altitude, azimuth: position.azimuth };
 }
@@ -89,6 +159,15 @@ function beijingDateKey(date = new Date()) {
     month: "2-digit",
     day: "2-digit",
   }).format(date);
+}
+// 卫星观测时刻（UTC）转北京时间显示；无精确时刻返回“昨日影像”
+function fmtObsTime(t: string | null) {
+  if (!t) return "昨日影像";
+  const m = t.match(/(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/);
+  if (!m) return t;
+  const d = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]) + 8 * 3600000);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())} 北京时间`;
 }
 function dip(heightKm: number) {
   return deg(Math.acos(6371 / (6371 + heightKm)));
@@ -384,37 +463,70 @@ async function directSceneData(
     corridorPoints = corridorDistances.map((km) =>
       destination(lat, lon, bearing, km),
     );
+  // 日出/日落光路剖面：沿太阳方位以细粒度采样云量（0→200km），
+  // 供「光路」视图绘制沿程云带与云边界标注
+  const sunPathDistances = [0, 5, 10, 15, 20, 25, 30, 40, 50, 60, 70, 80, 100, 120, 150, 180, 200],
+    sunPathPoints = sunPathDistances.map((km) =>
+      destination(lat, lon, bearing, km),
+    );
   const corridorLats = corridorPoints.map((p) => p[0].toFixed(5)).join(","),
     corridorLons = corridorPoints.map((p) => p[1].toFixed(5)).join(",");
-  const {
-    wf: wfUrl,
-    dem: demUrl,
-    vis: visUrl,
-    air: airUrl,
-    corridor: corridorUrl,
-  } = sceneUrls({ lat, lon, lats, lons, corridorLats, corridorLons });
-  const [wfResult, demResult, visResult, aqResult, corResult] =
+  const vars =
+    "cloud_cover_low,cloud_cover_mid,cloud_cover_high,direct_radiation,diffuse_radiation,boundary_layer_height,geopotential_height_850hPa,geopotential_height_500hPa,geopotential_height_250hPa";
+  const wfUrl = `https://api.open-meteo.com/v1/ecmwf?latitude=${lat}&longitude=${lon}&hourly=${vars}&daily=sunrise,sunset&timezone=Asia%2FShanghai&forecast_days=7`;
+  const demUrl = `https://api.open-meteo.com/v1/elevation?latitude=${lats}&longitude=${lons}`;
+  const visUrl = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&hourly=visibility,cloud_cover_low,cloud_cover_mid,cloud_cover_high,precipitation,cape,wind_speed_500hPa,wind_direction_500hPa,wind_gusts_10m,wind_speed_10m,wind_direction_10m,wind_speed_850hPa,wind_direction_850hPa,wind_speed_250hPa,wind_direction_250hPa&timezone=Asia%2FShanghai&forecast_days=7`;
+  const airUrl = `https://air-quality-api.open-meteo.com/v1/air-quality?latitude=${lat}&longitude=${lon}&hourly=aerosol_optical_depth,pm2_5&timezone=Asia%2FShanghai&forecast_days=7`;
+  const corridorUrl = `https://api.open-meteo.com/v1/ecmwf?latitude=${corridorLats}&longitude=${corridorLons}&hourly=cloud_cover_low,cloud_cover_mid,cloud_cover_high&timezone=Asia%2FShanghai&forecast_days=7`;
+  const sunPathLats = sunPathPoints.map((p) => p[0].toFixed(5)).join(","),
+    sunPathLons = sunPathPoints.map((p) => p[1].toFixed(5)).join(","),
+    sunPathUrl = `https://api.open-meteo.com/v1/ecmwf?latitude=${sunPathLats}&longitude=${sunPathLons}&hourly=cloud_cover_low,cloud_cover_mid,cloud_cover_high&timezone=Asia%2FShanghai&forecast_days=7`;
+  const [wfResult, demResult, visResult, aqResult, corResult, sunPathResult] =
     await Promise.allSettled([
-      fetch(wfUrl, { signal }),
-      fetch(demUrl, { signal }),
-      fetch(visUrl, { signal }),
-      fetch(airUrl, { signal }),
-      fetch(corridorUrl, { signal }),
+      fetch(wfUrl, { signal: withTimeout(signal, 20000) }),
+      fetch(demUrl, { signal: withTimeout(signal, 20000) }),
+      fetch(visUrl, { signal: withTimeout(signal, 20000) }),
+      fetch(airUrl, { signal: withTimeout(signal, 20000) }),
+      fetch(corridorUrl, { signal: withTimeout(signal, 20000) }),
+      fetch(sunPathUrl, { signal: withTimeout(signal, 20000) }),
     ]);
   if (wfResult.status !== "fulfilled" || !wfResult.value.ok)
     throw new Error("ECMWF 暂时无法连接");
   const weather = await wfResult.value.json();
-  let elevations = Array(points.length).fill(weather.elevation || 0);
+  // DEM 高程清洗：Open-Meteo elevation 接口存在间歇性返回空数组/长度不足/含 null 的情况，
+  // 若直接透传会导致地形网格出现 NaN、取景界面地形消失。任何异常都回退站址海拔。
+  const fallbackElev = Number(weather.elevation) || 500;
+  let elevations = Array(points.length).fill(fallbackElev);
   if (demResult.status === "fulfilled" && demResult.value.ok) {
     const elevationData = await demResult.value.json();
-    if (Array.isArray(elevationData.elevation))
-      elevations = elevationData.elevation;
+    if (
+      Array.isArray(elevationData.elevation) &&
+      elevationData.elevation.length === points.length
+    ) {
+      elevations = elevationData.elevation.map((e) =>
+        Number.isFinite(Number(e)) ? Number(e) : fallbackElev,
+      );
+    }
   }
   let comparison = null;
   if (visResult.status === "fulfilled" && visResult.value.ok) {
     const v = await visResult.value.json();
     comparison = v;
     weather.hourly.visibility = v.hourly?.visibility || [];
+    // 阵风与多层风场（供「阵风/风切变」面板）
+    [
+      "wind_gusts_10m",
+      "wind_speed_10m",
+      "wind_direction_10m",
+      "wind_speed_850hPa",
+      "wind_direction_850hPa",
+      "wind_speed_500hPa",
+      "wind_direction_500hPa",
+      "wind_speed_250hPa",
+      "wind_direction_250hPa",
+    ].forEach((k) => {
+      weather.hourly[k] = v.hourly?.[k] || [];
+    });
   }
   if (aqResult.status === "fulfilled" && aqResult.value.ok) {
     const a = await aqResult.value.json();
@@ -426,12 +538,14 @@ async function directSceneData(
     corResult.status === "fulfilled" && corResult.value.ok
       ? await corResult.value.json()
       : [];
+  const sunPathData =
+    sunPathResult.status === "fulfilled" && sunPathResult.value.ok
+      ? await sunPathResult.value.json()
+      : [];
   const grid = depths.map((_, di) =>
     laterals.map((__, li) => elevations[di * laterals.length + li]),
   );
-  const day = new Date(Date.now() - 86400000).toISOString().slice(0, 10),
-    bbox = `${lon - 4},${lat - 3},${lon + 4},${lat + 3}`;
-  const satellite = `https://gibs.earthdata.nasa.gov/wms/epsg4326/best/wms.cgi?SERVICE=WMS&REQUEST=GetMap&VERSION=1.1.1&LAYERS=VIIRS_SNPP_CorrectedReflectance_TrueColor&STYLES=&FORMAT=image/jpeg&TRANSPARENT=false&HEIGHT=300&WIDTH=420&SRS=EPSG:4326&BBOX=${bbox}&TIME=${day}`;
+  const satellite = await getPrimarySatellite(lat, lon, signal);
   return {
     weather,
     comparison,
@@ -440,9 +554,12 @@ async function directSceneData(
       distances: corridorDistances,
       forecasts: Array.isArray(corridorData) ? corridorData : [],
     },
+    sunPath: {
+      distances: sunPathDistances,
+      forecasts: Array.isArray(sunPathData) ? sunPathData : [],
+    },
     satellite,
     updated: new Date().toISOString(),
-    modelUpdate: forecastUpdateAt(new Date()).toISOString(),
   };
 }
 
@@ -459,15 +576,17 @@ function Scene({
   viewBearing,
   scenario,
   wind500,
-  cape,
-  precipitation,
   aod,
   visibilityKm,
+  precipitation,
   illumination,
   event,
   lat,
   lon,
+  cb,
+  genus,
   onLookChange,
+  pitch,
 }: {
   solar: Solar;
   cover: number[];
@@ -481,66 +600,21 @@ function Scene({
   viewBearing: number;
   scenario: string;
   wind500: number;
-  cape: number;
-  precipitation: number;
   aod: number;
   visibilityKm: number;
+  precipitation: number;
   illumination: boolean[];
   event: Date | null;
   lat: number;
   lon: number;
+  cb: boolean;
+  genus: { low: CloudGenus; mid: CloudGenus; high: CloudGenus };
   onLookChange: (look: number) => void;
+  pitch?: number;
 }) {
   const ref = useRef<HTMLCanvasElement>(null),
-    drag = useRef({ on: false, x: 0 }),
-    sunImg = useRef<HTMLImageElement | null>(null),
-    sunTried = useRef<string[]>([]),
-    sunFrac = useRef(0.9),
-    sunSat = useRef(0.7);
+    drag = useRef({ on: false, x: 0 });
   const [look, setLook] = useState(0);
-  useEffect(() => {
-    let alive = true;
-    const load = () => {
-      const url = nextSunUrl(sunTried.current);
-      if (!url) return;
-      sunTried.current.push(url);
-      const img = new Image();
-      img.onload = () => {
-        if (!alive) return;
-        sunImg.current = img;
-        // 采用该图源预设的日面占比与饱和度（SDO 无 CORS 头，运行时无法读像素，
-        // 预设为离线实测值）；若图源意外携带 CORS 头，再以运行时采样覆盖。
-        const preset = sunSourceMeta(url);
-        sunFrac.current = preset.diskFrac;
-        sunSat.current = preset.saturation;
-        try {
-          const s = 48,
-            cv = document.createElement("canvas");
-          cv.width = s;
-          cv.height = s;
-          const cx = cv.getContext("2d", { willReadFrequently: true });
-          if (cx) {
-            cx.drawImage(img, 0, 0, s, s);
-            const stats = sunDiskStats(cx.getImageData(0, 0, s, s).data, s, s);
-            if (stats.disk) {
-              sunFrac.current = stats.frac;
-              sunSat.current = stats.saturation;
-            }
-          }
-        } catch {
-          /* 无 CORS 头导致画布被污染时，沿用预设值 */
-        }
-      };
-      img.onerror = () => {
-        if (alive) load();
-      };
-      img.src = url;
-    };
-    load();
-    return () => {
-      alive = false;
-    };
-  }, []);
   useEffect(() => {
     const c = ref.current,
       x = c?.getContext("2d");
@@ -557,7 +631,9 @@ function Scene({
         c.height = h * d;
       }
       x.setTransform(d, 0, 0, d, 0, 0);
-      const hor = h * 0.61,
+      // 仰角联动：上仰 → 地平线下移、天空占比增大；下俯反之
+      const pitchPx = Math.max(-18, Math.min(18, pitch ?? 0)) * (h / 560),
+        hor = h * 0.61 + pitchPx,
         warm = Math.max(0, 1 - Math.abs(solar.altitude + 1) / 7),
         aerosol = Math.max(0, Math.min(1, (aod - 0.08) / 0.72)),
         cloudiness = Math.min(
@@ -568,23 +644,32 @@ function Scene({
           0,
           Math.min(1, (14 - visibilityKm) / 14 + aerosol * 0.45),
         ),
+        // 阴天遮光因子（提前计算，供天空渐变和云色共用）
+        overcast = calcOvercast(cover, precipitation, visibilityKm * 1000),
         sky = x.createLinearGradient(0, 0, 0, hor);
       sky.addColorStop(
         0,
-        `rgb(${29 + warm * 35 + aerosol * 42 + cloudiness * 18},${45 + warm * 12 + aerosol * 34 + cloudiness * 14},${84 + warm * 12 + aerosol * 18 + cloudiness * 8})`,
+        // 阴天时天空顶部从蓝紫向灰白偏移
+        overcast > 0.4
+          ? `rgb(${56 + overcast * 50},${64 + overcast * 40},${78 - overcast * 20})`
+          : `rgb(${29 + warm * 35 + aerosol * 42 + cloudiness * 18},${45 + warm * 12 + aerosol * 34 + cloudiness * 14},${84 + warm * 12 + aerosol * 18 + cloudiness * 8})`,
       );
       sky.addColorStop(
         0.65,
-        `rgb(${104 + warm * 95},${91 + warm * 35},${124 - warm * 38})`,
+        overcast > 0.4
+          ? `rgb(${68 + overcast * 30},${72 + overcast * 20},${76 - overcast * 10})`
+          : `rgb(${104 + warm * 95},${91 + warm * 35},${124 - warm * 38})`,
       );
       sky.addColorStop(
         1,
-        `rgb(${220 + warm * 32},${116 + warm * 58},${70 + warm * 18})`,
+        overcast > 0.4
+          ? `rgb(${80 + overcast * 20},${76 + overcast * 15},${74 - overcast * 5})`
+          : `rgb(${220 + warm * 32},${116 + warm * 58},${70 + warm * 18})`,
       );
       x.fillStyle = sky;
       x.fillRect(0, 0, w, h);
       if (cloudiness > 0.12) {
-        x.fillStyle = `rgba(56,67,91,${cloudiness * (0.13 + murk * 0.16)})`;
+        x.fillStyle = `rgba(56,67,91,${cloudiness * (0.13 + murk * 0.16 + overcast * 0.2)})`;
         x.fillRect(0, 0, w, hor * 0.72);
       }
       if (aerosol > 0) {
@@ -614,46 +699,24 @@ function Scene({
       x.translate(-w / 2, -hor);
       const azimuthOffset = ((solar.azimuth - viewBearing + 540) % 360) - 180,
         sx = w / 2 + ((azimuthOffset + look) * w) / referenceFov,
-        sy = hor - solar.altitude * 9,
-        g = x.createRadialGradient(sx, sy, 1, sx, sy, 150);
-      g.addColorStop(0, "rgba(255,244,185,.95)");
-      g.addColorStop(0.1, "rgba(255,190,100,.65)");
-      g.addColorStop(1, "rgba(255,120,50,0)");
-      x.fillStyle = g;
-      x.fillRect(0, 0, w, hor);
-      const sunR = Math.max(
-          3,
-          Math.min(w * 0.16, (0.53 / referenceFov) * w * 0.5),
-        ),
-        sImg = sunImg.current;
-      x.beginPath();
-      x.arc(sx, sy, sunR, 0, Math.PI * 2);
-      if (sImg && sImg.naturalWidth > 0) {
-        x.save();
-        x.clip();
-        // 按实测日面占比铺满圆形（避免硬编码 0.8 导致日面被裁或露黑边）
-        const k = (sunR * 2) / (sImg.naturalWidth * sunFrac.current);
-        // 轻微增强对比度，让白光日面上的黑子更清晰（无需读像素，不触发 CORS 污染）
-        x.filter = "brightness(1.03) contrast(1.4)";
-        x.drawImage(
-          sImg,
-          sx - sunR,
-          sy - sunR,
-          sImg.naturalWidth * k,
-          sImg.naturalHeight * k,
+        sy = hor - solar.altitude * 9;
+      // 阴天时太阳光晕淡出
+      if (overcast < 0.5) {
+        const g = x.createRadialGradient(sx, sy, 1, sx, sy, 150);
+        g.addColorStop(0, "rgba(255,244,185,.95)");
+        g.addColorStop(0.1, "rgba(255,190,100,.65)");
+        g.addColorStop(1, "rgba(255,120,50,0)");
+        x.fillStyle = g;
+        x.fillRect(0, 0, w, hor);
+        x.beginPath();
+        x.arc(
+          sx,
+          sy,
+          Math.max(3, Math.min(w * 0.16, (0.53 / referenceFov) * w * 0.5)),
+          0,
+          Math.PI * 2,
         );
-        x.filter = "none";
-        // 白光日面（低饱和）叠加轻量暖色径向渐变，保留黑子对比度同时融入日落氛围
-        const tintA = sunTintAlpha(sunSat.current),
-          warm = x.createRadialGradient(sx, sy, sunR * 0.08, sx, sy, sunR);
-        warm.addColorStop(0, `rgba(255,240,195,${tintA})`);
-        warm.addColorStop(0.55, `rgba(255,180,100,${tintA * 0.92})`);
-        warm.addColorStop(1, `rgba(255,120,52,${tintA})`);
-        x.fillStyle = warm;
-        x.fill();
-        x.restore();
-      } else {
-        x.fillStyle = "#fff1b3";
+        x.fillStyle = overcast > 0.3 ? `rgba(200,190,180,${0.5 - overcast})` : "#fff1b3";
         x.fill();
       }
       // 巧摄式太阳轨迹弧线：以日出/日落为锚点 ±150 分钟，随取景环顾同步平移
@@ -704,29 +767,13 @@ function Scene({
         mix = (from: number[], to: number[], amount: number) =>
           from.map((v, i) => Math.round(v + (to[i] - v) * clamp(amount))),
         aodHaze = clamp((aod - 0.08) / 0.65),
-        redProgress = clamp((-solar.altitude - 0.15) / 5.4),
         lowSun = clamp(1 - Math.abs(solar.altitude + 1.2) / 8);
-      const cloudTone = (km: number, layer: number, sunlit: boolean) => {
-        if (!sunlit)
-          return mix(
-            [91, 105, 127],
-            [72, 73, 91],
-            layer * 0.18 + aodHaze * 0.16,
-          );
-        // 文档比色卡：低云主要橘红；云底越高，金黄→橘红的色域越完整；AOD升高则褪灰、变暗。
-        const gold = [255, 198, 102],
-          orange = [245, 105, 57],
-          crimson = [198, 53, 48],
-          lowCloud = [229, 96, 55];
-        let color = km < 2.7 ? lowCloud : mix(gold, orange, redProgress);
-        if (km >= 4.2) color = mix(color, crimson, redProgress * 0.7);
-        if (km >= 8) color = mix(gold, crimson, redProgress * 0.9);
-        color = mix(color, [185, 166, 164], aodHaze * 0.72);
-        return mix(color, [56, 66, 84], (1 - lowSun) * 0.38 + aodHaze * 0.13);
-      };
-      const highTone = cloudTone(heights[2] || 10, 2, illumination[2]),
-        midTone = cloudTone(heights[1] || 5.5, 1, illumination[1]),
-        lowTone = cloudTone(heights[0] || 1.5, 0, illumination[0]);
+      // 云色统一取自共享比色模块 cloud-color.ts（依据《火烧云定量预报》比色卡）：
+      // 云底越高色域越全（金黄→绯红）、AOD 升高则褪灰；三处渲染共用，避免漂移。
+      // overcast 阴天因子使厚云/雨天云色褪为灰白，不再渲染暖色。
+      const highTone = cloudTone(heights[2] || 10, genus.high, illumination[2], lowSun, aodHaze, overcast),
+        midTone = cloudTone(heights[1] || 5.5, genus.mid, illumination[1], lowSun, aodHaze, overcast),
+        lowTone = cloudTone(heights[0] || 1.5, genus.low, illumination[0], lowSun, aodHaze, overcast);
       const veil = (
         y: number,
         amount: number,
@@ -764,7 +811,6 @@ function Scene({
         amount: number,
         tone: number[],
         sunlit: boolean,
-        stretch = 1,
       ) => {
         x.save();
         const lines = cirrusCount(amount);
@@ -779,9 +825,9 @@ function Scene({
           x.bezierCurveTo(
             px - 18,
             yy - 18,
-            px + 54 * stretch + wind500 * 1.5 * stretch,
+            px + 54 + wind500 * 1.5,
             yy + 16,
-            px + 132 * stretch + wind500 * 2.3 * stretch,
+            px + 132 + wind500 * 2.3,
             yy - 9 + n(i + 3) * 17,
           );
           x.stroke();
@@ -795,7 +841,6 @@ function Scene({
         scale: number,
         low = false,
         sunlit = false,
-        morph?: CloudMorphology,
       ) => {
         const ow = 224,
           oh = low ? 86 : 64,
@@ -842,33 +887,24 @@ function Scene({
           bright = mix(tone, [255, 225, 170], sunlit ? 0.46 : 0.08),
           shade = mix(tone, [27, 39, 56], low ? 0.56 : 0.38),
           threshold = deckThreshold(amount),
-          flow = drift * (low ? 0.011 : 0.016),
-          // 云属形态配方：未指定时回退到基准配方（等价旧行为）。
-          m: CloudMorphology = morph ?? {
-            perlinMix: 0.7,
-            freq: 1,
-            erosionMul: 1,
-            verticalExp: low ? 0.72 : 1.3,
-            anisotropy: 1,
-            alphaMul: 1,
-          };
+          flow = drift * (low ? 0.011 : 0.016);
         for (let py = 0; py < oh; py++)
           for (let px = 0; px < ow; px++) {
-            const u =
-                ((px / ow) * (low ? 5.6 : 7.4) * m.freq) / m.anisotropy + flow,
-              v = (py / oh) * (low ? 2.4 : 3.3) * m.freq,
+            const u = (px / ow) * (low ? 5.6 : 7.4) + flow,
+              v = (py / oh) * (low ? 2.4 : 3.3),
               perlin = fbm(u, v),
               cellular =
                 1 -
                 worley(u * (low ? 2.1 : 2.8) + 7, v * (low ? 2.1 : 2.8) - 5),
               // 云属配方：Perlin 定平滑主体，Worley 按权重制造团块/孔洞。
-              shape = perlin * m.perlinMix + cellular * (1 - m.perlinMix),
+              shape = perlin * 0.7 + cellular * 0.3,
               height01 = py / oh,
-              vertical = Math.pow(Math.sin(Math.PI * height01), m.verticalExp),
-              erosion =
-                worley(u * 5.7 - 14, v * 5.7 + 9) *
-                (low ? 0.17 : 0.24) *
-                m.erosionMul,
+              vertical = Math.pow(
+                Math.sin(Math.PI * height01),
+                low ? 0.72 : 1.3,
+              ),
+              // 高频 Worley 侵蚀云缘（G 通道思路），制造絮状细节
+              erosion = worley(u * 5.7 - 14, v * 5.7 + 9) * (low ? 0.17 : 0.24),
               density =
                 clamp((shape - erosion - threshold) * 5.2) *
                 clamp(vertical * 1.7),
@@ -900,8 +936,31 @@ function Scene({
         }
         x.restore();
       };
+      const strata = (
+        y: number,
+        amount: number,
+        tone: number[],
+        sunlit: boolean,
+      ) => {
+        x.save();
+        x.globalAlpha = (sunlit ? 0.24 : 0.14) + amount / 330;
+        x.fillStyle = `rgb(${tone.join(",")})`;
+        for (let band = 0; band < 4; band++) {
+          x.beginPath();
+          x.moveTo(-25, y - 38 + band * 22);
+          for (let px = 0; px <= w + 50; px += 48)
+            x.lineTo(px, y - 38 + band * 22 + (n(px * 0.11 + band) - 0.5) * 16);
+          x.lineTo(w + 25, y + 4 + band * 22);
+          x.lineTo(-25, y + 14 + band * 22);
+          x.closePath();
+          x.fill();
+        }
+        x.restore();
+      };
+      const cloudY = (km: number) =>
+        hor - (Math.min(13, Math.max(0.2, km)) / 13) * h * 0.5;
       // 积雨云 Cb：高耸花椰菜状塔身 + 薄广铁砧云顶 + 垂落雨幡 + 乳状云下缘。
-      // CAPE/降水判定为对流云时替代通用纹理云层，呈现雷暴云顶天立地的形态。
+      // 以 CAPE/降水/高空风判定为强对流时替代通用低云层，呈现雷暴云顶天立地的形态。
       const cumulonimbus = (
         baseY: number,
         anvilY: number,
@@ -1050,101 +1109,12 @@ function Scene({
         x.fill();
         x.restore();
       };
-      const strata = (
-        y: number,
-        amount: number,
-        tone: number[],
-        sunlit: boolean,
-      ) => {
-        x.save();
-        x.globalAlpha = (sunlit ? 0.24 : 0.14) + amount / 330;
-        x.fillStyle = `rgb(${tone.join(",")})`;
-        for (let band = 0; band < 4; band++) {
-          x.beginPath();
-          x.moveTo(-25, y - 38 + band * 22);
-          for (let px = 0; px <= w + 50; px += 48)
-            x.lineTo(px, y - 38 + band * 22 + (n(px * 0.11 + band) - 0.5) * 16);
-          x.lineTo(w + 25, y + 4 + band * 22);
-          x.lineTo(-25, y + 14 + band * 22);
-          x.closePath();
-          x.fill();
-        }
-        x.restore();
-      };
-      const cloudY = (km: number) =>
-        hor - (Math.min(13, Math.max(0.2, km)) / 13) * h * 0.5;
       const highY = cloudY(heights[2] || 10),
         midY = cloudY(heights[1] || 5.5),
         lowY = cloudY(heights[0] || 1.5);
-      // 云属识别：用 CAPE/降水/高空风把三层云量映射到《国际云图》云属，
-      // 再取出对应的形态配方（噪声混合、拉伸、侵蚀、厚度），驱动纹理渲染。
-      const coverTriple: [number, number, number] = [cover[0], cover[1], cover[2]],
-        heightTriple: [number, number, number] = [
-          heights[0],
-          heights[1],
-          heights[2],
-        ],
-        genus = classifyGenus({
-          cape,
-          precipitation,
-          wind: wind500,
-          cover: coverTriple,
-          heights: heightTriple,
-        });
-      const lowMorph = GENUS_MORPHOLOGY[genus.low],
-        midMorph = GENUS_MORPHOLOGY[genus.mid],
-        highMorph = GENUS_MORPHOLOGY[genus.high];
-      // CloudSat 厚度联动：云属垂直结构配方（GENUS_PROFILE 厚度 km）
-      // → 纹理云层纵向拉伸倍率，厚云更"顶天立地"、薄云更扁平铺展。
-      const thicknessScale = (g: CloudGenus) =>
-        Math.max(0.7, Math.min(1.7, 0.7 + GENUS_PROFILE[g].thickness * 0.22));
-      // 积雨云优先：低层判定为积雨云 Cb 时，用专属雷暴云形态（塔状+铁砧+雨幡）
-      // 覆盖整个垂直柱，替代通用的低/中/高纹理云层，避免叠画干扰。
-      const cbActive = visible[0] && genus.low === "cumulonimbus",
+      const cbActive = visible[0] && cb,
         cbAnvilY = cloudY(Math.max(11, heights[2] || 10));
-      if (visible[2] && !cbActive) {
-        const hp = highCloudPlan(cover[2]);
-        if (hp.mode === "deck")
-          texturedDeck(
-            highY,
-            hp.amount,
-            highTone,
-            0.55 * thicknessScale(genus.high),
-            false,
-            illumination[2],
-            highMorph,
-          );
-        else
-          cirrus(
-            highY,
-            cover[2],
-            highTone,
-            illumination[2],
-            Math.max(1, highMorph.anisotropy),
-          );
-      }
-      if (visible[1] && !(cbActive && genus.mid === "cumulonimbus")) {
-        texturedDeck(
-          midY,
-          cover[1],
-          midTone,
-          0.78 * thicknessScale(genus.mid),
-          false,
-          illumination[1],
-          midMorph,
-        );
-      }
-      if (visible[0] && !cbActive)
-        texturedDeck(
-          lowY,
-          cover[0],
-          lowTone,
-          1.18 * thicknessScale(genus.low),
-          true,
-          illumination[0],
-          lowMorph,
-        );
-      if (cbActive)
+      if (cbActive) {
         cumulonimbus(
           lowY,
           cbAnvilY,
@@ -1152,28 +1122,55 @@ function Scene({
           lowTone,
           illumination[0] || illumination[1],
         );
-      const totalCover = 100 * (1 - (1-cover[0]/100)*(1-cover[1]/100)*(1-cover[2]/100)),
-        totalHaze = totalHazePlan(totalCover);
-      if (totalHaze.visible) {
+      } else {
+        if (visible[2]) {
+          if (cover[2] > 62)
+            texturedDeck(
+              highY,
+              cover[2] * 0.72,
+              highTone,
+              0.55,
+              false,
+              illumination[2],
+            );
+          else cirrus(highY, cover[2], highTone, illumination[2]);
+        }
+        if (visible[1]) {
+          texturedDeck(midY, cover[1], midTone, 0.78, false, illumination[1]);
+        }
+        if (visible[0])
+          texturedDeck(lowY, cover[0], lowTone, 1.18, true, illumination[0]);
+      }
+      const totalCover = 100 * (1 - (1-cover[0]/100)*(1-cover[1]/100)*(1-cover[2]/100));
+      if (totalCover > 38) {
         const deck = x.createLinearGradient(0, highY - 28, 0, lowY + 70);
-        deck.addColorStop(0, `rgba(${highTone.join(",")},${totalHaze.alphaTop.toFixed(3)})`);
-        deck.addColorStop(1, `rgba(${midTone.join(",")},${totalHaze.alphaBottom.toFixed(3)})`);
+        deck.addColorStop(0, `rgba(${highTone.join(",")},${Math.max(0,.12+(totalCover-38)/360)})`);
+        deck.addColorStop(1, `rgba(${midTone.join(",")},${Math.max(0,.08+(totalCover-38)/420)})`);
         x.fillStyle = deck;
         x.fillRect(-20, highY-30, w+40, Math.max(70, lowY-highY+100));
       }
-      // —— 地形：对 7×5 的粗糙 DEM 做双线性细分得到平滑曲面，再叠加海拔配色、太阳侧光与大气透视。
-      const rows = dem.length
+      // —— 地形：DEM 双线性细分 + 多倍频分形山脊噪声，塑造层叠山峦
+      //    预计算高程网格 + 远→近渐变着色，消除面片棱角
+      //    防御：任何非有限高程（异常 DEM 数据）回退 500m，避免 NaN 路径导致地形消失
+      const rawRows = dem.length
           ? dem
           : [
-              [500, 510, 495, 505, 500],
-              [510, 520, 500, 515, 508],
-              [520, 530, 510, 525, 515],
+              [380, 560, 420, 640, 470],
+              [520, 780, 560, 860, 610],
+              [470, 700, 500, 780, 540],
+              [610, 920, 640, 1000, 700],
+              [540, 810, 570, 880, 620],
+              [660, 980, 690, 1060, 740],
+              [580, 860, 610, 940, 660],
             ],
+        rows = rawRows.map((row) =>
+          row.map((v) => (Number.isFinite(Number(v)) ? Number(v) : 500)),
+        ),
         flat = rows.flat(),
         mn = Math.min(...flat),
         mx = Math.max(...flat),
-        span = Math.max(120, mx - mn),
-        SUB = 4,
+        span = Number.isFinite(mn) ? Math.max(120, mx - mn) : 120,
+        SUB = 12,
         RU = (rows.length - 1) * SUB,
         CU = (rows[0].length - 1) * SUB,
         D0 = demDepths && demDepths.length > 1 ? demDepths : null,
@@ -1185,6 +1182,47 @@ function Scene({
                 D0[Math.min(rows.length - 2, Math.floor(u / SUB))]) /
               SUB
             : 9 / SUB,
+        clampV = (v: number, lo: number, hi: number) =>
+          Math.max(lo, Math.min(hi, v)),
+        // 2D 值噪声 + 山脊变换：制造尖锐山脊与沟谷（复用 n() 哈希）
+        tnoise = (u: number, v: number) => {
+          const cell = (gx: number, gy: number) =>
+              n(gx * 127.1 + gy * 311.7 + 7.3),
+            g2 = (a: number, b: number) => {
+              const ix = Math.floor(a),
+                iy = Math.floor(b),
+                tx = a - ix,
+                ty = b - iy,
+                sx = tx * tx * (3 - 2 * tx),
+                sy = ty * ty * (3 - 2 * ty),
+                p00 = cell(ix, iy),
+                p10 = cell(ix + 1, iy),
+                p01 = cell(ix, iy + 1),
+                p11 = cell(ix + 1, iy + 1);
+              return (
+                p00 +
+                (p10 - p00) * sx +
+                (p01 - p00) * sy +
+                (p00 - p10 - p01 + p11) * sx * sy
+              );
+            },
+            ridge = (a: number, b: number) => {
+              const v = g2(a, b);
+              return 1 - Math.abs(2 * v - 1);
+            };
+          // 大山系 + 中山脊 + 细节纹理，山脊做高次幂锐化（更尖的刃脊、更深的沟谷）
+          // 高频分量权重压低，避免相邻面片颜色跳变（消除"折纸感"）
+          const big = ridge(u * 0.32 + 3.1, v * 0.32 - 1.7),
+            mid = ridge(u * 0.9 - 5.3, v * 0.9 + 2.9),
+            fine = g2(u * 2.4 + 11, v * 2.4 - 7),
+            micro = g2(u * 5.2 - 13, v * 5.2 + 19);
+          return (
+            Math.pow(big, 2.2) * 0.5 +
+            Math.pow(mid, 1.7) * 0.32 +
+            fine * 0.1 +
+            micro * 0.04
+          );
+        },
         elevAt = (u: number, v: number) => {
           const r = u / SUB,
             c = v / SUB,
@@ -1197,37 +1235,49 @@ function Scene({
             p00 = rows[r0][c0],
             p10 = rows[r0][c1],
             p01 = rows[r1][c0],
-            p11 = rows[r1][c1];
-          return (
-            p00 * (1 - s) * (1 - t) +
-            p10 * (1 - s) * t +
-            p01 * s * (1 - t) +
-            p11 * s * t
-          );
+            p11 = rows[r1][c1],
+            base =
+              p00 * (1 - s) * (1 - t) +
+              p10 * (1 - s) * t +
+              p01 * s * (1 - t) +
+              p11 * s * t;
+          // 分形山脊细节：远山低频大尺度山脊，近山高频细节（自然大气透视）
+          // 幅度随距离增大（近处山体起伏更明显）
+          const near = u / RU,
+            freq = 0.18 + 0.6 * near,
+            detail = (tnoise(u * freq, v * freq) - 0.5) * 2;
+          return base + detail * span * (0.22 + 0.8 * near);
         },
-        project = (u: number, v: number) => {
+        // 预计算高程网格，避免每面片重复采样
+        elevGrid: number[][] = [];
+      for (let u = 0; u <= RU; u++) {
+        const row: number[] = [];
+        for (let v = 0; v <= CU; v++) row.push(elevAt(u, v));
+        elevGrid.push(row);
+      }
+      const project = (u: number, v: number) => {
           const near = 1 - u / RU,
-            width = w * (0.28 + 0.76 * near),
-            left = (w - width) / 2;
+            width = w * (0.3 + 0.74 * near),
+            left = (w - width) / 2,
+            elevN = clampV((elevGrid[u][v] - mn) / span, 0, 1.3);
           return {
             x: left + (width * v) / CU,
             y:
               hor +
-              (h - hor) * (0.08 + 0.78 * near ** 1.6) -
-              ((elevAt(u, v) - mn) / span) * (22 + 72 * near),
+              (h - hor) * (0.06 + 0.8 * near ** 1.5) -
+              elevN * (72 + 124 * near),
           };
-        };
-      const clampV = (v: number, lo: number, hi: number) =>
-          Math.max(lo, Math.min(hi, v)),
-        tNorm = (e: number) => clampV((e - mn) / span, 0, 1),
-        // 海拔配色：河谷深绿 → 林线橄榄 → 草坡黄褐 → 山岩暖灰
+        },
+        tNorm = (e: number) => clampV((e - mn) / (span * 1.45), 0, 1),
+        // 海拔分层配色：河谷深青 → 林线橄榄 → 草坡金褐 → 山岩暖灰 → 高岩亮褐 → 雪顶
         ELEV_STOPS: [number, number[]][] = [
-          [0, [23, 46, 44]],
-          [0.2, [46, 74, 56]],
-          [0.45, [92, 104, 76]],
-          [0.65, [128, 118, 90]],
-          [0.85, [150, 128, 108]],
-          [1, [168, 140, 122]],
+          [0, [22, 52, 46]],
+          [0.13, [52, 88, 60]],
+          [0.29, [100, 114, 76]],
+          [0.47, [144, 130, 90]],
+          [0.65, [174, 150, 116]],
+          [0.83, [198, 172, 142]],
+          [1, [220, 196, 166]],
         ],
         ramp = (t: number) => {
           for (let i = 1; i < ELEV_STOPS.length; i++) {
@@ -1245,7 +1295,70 @@ function Scene({
         sunDepth = Math.cos((azimuthOffset * Math.PI) / 180),
         sunAltW = clampV(solar.altitude * 0.2 + 0.3, -0.1, 1),
         dusk = clampV(0.62 + solar.altitude * 0.14, 0.28, 1),
-        haze = [206, 156, 134];
+        haze = [206, 156, 134],
+        // 单点着色（渐变端点用）
+        shade = (u: number, v: number) => {
+          const e = elevGrid[u][v],
+            u0 = Math.max(0, u - 1),
+            u1 = Math.min(RU, u + 1),
+            v0 = Math.max(0, v - 1),
+            v1 = Math.min(CU, v + 1),
+            sd = elevGrid[u1][v] - elevGrid[u0][v],
+            sl = elevGrid[u][v1] - elevGrid[u][v0],
+            sdAng = Math.atan2(sd, dStep(u) * 1000),
+            slAng = Math.atan2(sl, stepLat * 1000),
+            // 大气透视分层：深度方向带状雾，强化"层峦"分隔；远山保留轮廓
+            layerFog = 0.5 + 0.5 * Math.sin((u / RU) * Math.PI * 2.6 + 1.1),
+            fog =
+              Math.pow(u / RU, 1.2) * (0.16 + murk * 0.5) +
+              layerFog * 0.05 * (u / RU),
+            jitter = (n(u * 37.1 + v * 13.7) - 0.5) * 0.05,
+            // 山脊棱线检测：深度方向局部高点 → 轮廓光；陡坡面 → 侧光
+            crest = clampV(
+              (e - Math.max(elevGrid[u0][v], elevGrid[u1][v])) /
+                (span * 0.1) +
+                0.5,
+              0,
+              1,
+            ),
+            ridgeSteep = clampV(Math.abs(sd) / (span * 0.45), 0, 1),
+            light = clampV(
+              0.2 +
+                -Math.sin(sdAng) * sunDepth * (0.5 + 0.55 * sunAltW) +
+                -Math.sin(slAng) * sunLateral * 0.8 +
+                tNorm(e) * 0.16 +
+                jitter,
+              -0.32,
+              1.15,
+            );
+          let col = ramp(tNorm(e));
+          // 雪顶：极高海拔混入冷白，强化山脊层次
+          const snow = clampV((tNorm(e) - 0.86) / 0.14, 0, 1);
+          col = mix(col, [235, 238, 240], snow * 0.8);
+          col = mix(col, [255, 178, 100], clampV(light, 0, 1) * 0.62);
+          // 背光面注入冷紫蓝，与暖色受光面形成互补对比
+          col = mix(col, [26, 34, 62], clampV(-light, 0, 1) * 0.6);
+          // 山脊轮廓光：棱线叠加暖色高光，强化层叠山峦（远山更强，勾勒天际线）
+          const rim = (crest * 0.6 + ridgeSteep * 0.4) * (1 - fog * 0.3);
+          col = mix(col, [255, 214, 152], rim * (0.42 + 0.3 * (u / RU)));
+          // 谷地压暗：相对低洼处加深，分离相邻山体
+          const valley = clampV(1 - tNorm(e) * 1.8, 0, 1);
+          col = mix(col, [8, 20, 26], valley * 0.38 * (1 - fog * 0.4));
+          // 大气透视：远山偏冷蓝紫、偏亮，与暖色天空分离；近山保留暖色
+          const dist = u / RU,
+            farCool = Math.pow(dist, 1.15);
+          col = mix(col, [146, 154, 190], farCool * 0.42);
+          col = mix(col, [235, 245, 250], farCool * 0.1);
+          col = mix(col, haze, fog * 0.6);
+          return col.map((c) => Math.round(c * dusk));
+        },
+        // 预计算着色网格（每点为 RGB 三元组）
+        shadeGrid: number[][][] = [];
+      for (let u = 0; u <= RU; u++) {
+        const row: number[][] = [];
+        for (let v = 0; v <= CU; v++) row.push(shade(u, v));
+        shadeGrid.push(row);
+      }
       for (let u = RU - 1; u >= 0; u--)
         for (let v = 0; v < CU; v++) {
           const a = project(u, v),
@@ -1258,37 +1371,35 @@ function Scene({
           x.lineTo(c2.x, c2.y);
           x.lineTo(d2.x, d2.y);
           x.closePath();
-          // 面元中心高程与坡向（横向/纵深差分），用于太阳侧光
-          const eC = elevAt(u + 0.5, v + 0.5),
-            sd = elevAt(u + 1, v + 0.5) - elevAt(u, v + 0.5),
-            sl = elevAt(u + 0.5, v + 1) - elevAt(u + 0.5, v),
-            sdAng = Math.atan2(sd, dStep(u) * 1000),
-            slAng = Math.atan2(sl, stepLat * 1000),
-            fog = Math.pow(u / RU, 1.3) * (0.3 + murk * 0.75),
-            jitter = (n(u * 37.1 + v * 13.7) - 0.5) * 0.07,
-            light = clampV(
-              0.2 +
-                -Math.sin(sdAng) * sunDepth * (0.45 + 0.55 * sunAltW) +
-                -Math.sin(slAng) * sunLateral * 0.75 +
-                tNorm(eC) * 0.12 +
-                jitter,
-              -0.32,
-              1.15,
+          // 远边→近边线性渐变，平滑纵深与坡向过渡，消除面片棱角
+          const ca = shadeGrid[u][v],
+            cb = shadeGrid[u][v + 1],
+            cc = shadeGrid[u + 1][v + 1],
+            cd = shadeGrid[u + 1][v],
+            farCol = [
+              Math.round((ca[0] + cb[0]) / 2),
+              Math.round((ca[1] + cb[1]) / 2),
+              Math.round((ca[2] + cb[2]) / 2),
+            ],
+            nearCol = [
+              Math.round((cc[0] + cd[0]) / 2),
+              Math.round((cc[1] + cd[1]) / 2),
+              Math.round((cc[2] + cd[2]) / 2),
+            ],
+            g = x.createLinearGradient(
+              (a.x + b.x) / 2,
+              (a.y + b.y) / 2,
+              (c2.x + d2.x) / 2,
+              (c2.y + d2.y) / 2,
             );
-          let col = ramp(tNorm(eC));
-          col = mix(col, [255, 174, 96], clampV(light, 0, 1) * 0.62);
-          col = mix(col, [15, 34, 50], clampV(-light, 0, 1) * 0.6);
-          col = mix(col, haze, fog * 0.82);
-          x.fillStyle = `rgb(${col.map((v) => Math.round(v * dusk)).join(",")})`;
+          g.addColorStop(0, `rgb(${farCol.join(",")})`);
+          g.addColorStop(1, `rgb(${nearCol.join(",")})`);
+          x.fillStyle = g;
           x.fill();
-          if (fog < 0.72) {
-            x.strokeStyle =
-              light > 0.15
-                ? `rgba(255,196,140,${(0.1 * (1 - fog)).toFixed(3)})`
-                : `rgba(14,32,42,${(0.12 * (1 - fog)).toFixed(3)})`;
-            x.lineWidth = 0.5;
-            x.stroke();
-          }
+          // 同色描边填补相邻面片抗锯齿缝隙，消除网格线
+          x.strokeStyle = g;
+          x.lineWidth = 0.6;
+          x.stroke();
         }
       // 地平线暖光混入：让最远山脊融入霞光雾气
       const hblend = x.createLinearGradient(0, hor - h * 0.05, 0, hor + h * 0.18);
@@ -1306,10 +1417,10 @@ function Scene({
       const fg = x.createLinearGradient(0, hor + h * 0.04, 0, h);
       fg.addColorStop(
         0,
-        `rgba(${mix(ramp(0), [30, 46, 48], 0.6).join(",")},0.9)`,
+        `rgba(${mix(ramp(0), [34, 50, 52], 0.5).join(",")},0.88)`,
       );
-      fg.addColorStop(0.35, "rgba(15,27,31,0.97)");
-      fg.addColorStop(1, "#060b0e");
+      fg.addColorStop(0.35, "rgba(22,34,38,0.94)");
+      fg.addColorStop(1, "#0a1014");
       x.fillStyle = fg;
       x.fill();
       x.restore();
@@ -1345,6 +1456,7 @@ function Scene({
     focal,
     playing,
     look,
+    pitch,
     viewBearing,
     scenario,
     wind500,
@@ -1389,20 +1501,47 @@ export default function Home() {
     [playing, setPlaying] = useState(false),
     [focal, setFocal] = useState(85),
     [lookOffset, setLookOffset] = useState(0),
-    [sceneView, setSceneView] = useState<"view" | "profile">("view"),
+    [pitchOffset, setPitchOffset] = useState(0),
+    [sceneView, setSceneView] = useState<"view" | "profile" | "sunpath">(
+      "view",
+    ),
     [visible, setVisible] = useState([true, true, true]),
     [demoCb, setDemoCb] = useState(false),
-    [dataPanel, setDataPanel] = useState(false),
+    [cloudsatZoom, setCloudsatZoom] = useState(false),
     [data, setData] = useState<SceneData | null>(null),
+    [satSource, setSatSource] = useState<SatSource>("hima9-ir"),
+    [satInfo, setSatInfo] = useState<SatelliteInfo | null>(null),
+    [satError, setSatError] = useState(false),
+    [satFrames, setSatFrames] = useState<SatelliteFrame[]>([]),
+    [animFrame, setAnimFrame] = useState(0),
+    [animPlaying, setAnimPlaying] = useState(false),
     [loading, setLoading] = useState(true),
     [clock, setClock] = useState<number | null>(null),
+    [updatedAt, setUpdatedAt] = useState<number | null>(null),
     [nextRefreshAt, setNextRefreshAt] = useState(0),
-    [error, setError] = useState("");
+    [error, setError] = useState(""),
+    [cityRankOpen, setCityRankOpen] = useState(false),
+    [cityRanks, setCityRanks] = useState<CityRank[]>([]),
+    [cityRankKey, setCityRankKey] = useState(""),
+    [cityRankLoading, setCityRankLoading] = useState(false),
+    [cityRankError, setCityRankError] = useState(""),
+    [cityRankSharing, setCityRankSharing] = useState(false),
+    [shareReady, setShareReady] = useState(false),
+    [searchQuery, setSearchQuery] = useState(""),
+    [searchResults, setSearchResults] = useState<GeoResult[]>([]),
+    [searching, setSearching] = useState(false),
+    [searchOpen, setSearchOpen] = useState(false),
+    [mobileSettings, setMobileSettings] = useState(false);
   const requestRef = useRef({
       id: 0,
       controller: null as AbortController | null,
     }),
-    cacheRef = useRef(new Map<string, SceneData>());
+    cacheRef = useRef(new Map<string, SceneData>()),
+    searchRef = useRef({
+      id: 0,
+      controller: null as AbortController | null,
+    }),
+    shareFilesRef = useRef<File[]>([]);
   const loc = place === "地图选点" ? customLocation : places[place],
     bearing = mode === "sunset" ? 278 : 78;
   const load = async () => {
@@ -1415,16 +1554,39 @@ export default function Home() {
     if (cached) setData(cached);
     setLoading(true);
     setError("");
+    // 卫星影像与卫星云密度独立于 ECMWF：即使天气数据失败也能显示真实云
+    const primarySat = await getPrimarySatellite(
+      loc.lat,
+      loc.lon,
+      controller.signal,
+    );
+    if (requestId !== requestRef.current.id || controller.signal.aborted)
+      return;
+    setSatInfo(primarySat);
+    setSatSource(primarySat.source);
+    setSatError(false);
+    // 异步加载多帧历史卫星云图，独立于主流程
+    getSatelliteFrames(primarySat.source, loc.lat, loc.lon, controller.signal)
+      .then((fs) => { if (!controller.signal.aborted) setSatFrames(fs); })
+      .catch(() => {});
+    setAnimFrame(0);
+    setAnimPlaying(false);
     try {
       let next: SceneData | null = null;
-      try {
-        const proxy = await fetch(
-          `/api/scene?lat=${loc.lat}&lon=${loc.lon}&bearing=${bearing}`,
-          { signal: controller.signal },
-        );
-        if (proxy.ok) next = await proxy.json();
-      } catch {
-        if (controller.signal.aborted) return;
+      // 静态托管（GitHub Pages）没有 /api/scene 后端，直接浏览器直连 Open-Meteo
+      if (!__STATIC__) {
+        try {
+          // API 路由 8 秒超时：服务端不可达时快速回退到浏览器直连
+          const proxy = await fetch(
+            `/api/scene?lat=${loc.lat}&lon=${loc.lon}&bearing=${bearing}`,
+            {
+              signal: withTimeout(controller.signal, 8000),
+            },
+          );
+          if (proxy.ok) next = await proxy.json();
+        } catch {
+          if (controller.signal.aborted) return;
+        }
       }
       if (!next)
         next = await directSceneData(
@@ -1437,6 +1599,7 @@ export default function Home() {
         return;
       cacheRef.current.set(key, next);
       setData(next);
+      setUpdatedAt(Date.now());
       setNextRefreshAt(Date.now() + 600000);
     } catch (e) {
       if (controller.signal.aborted || requestId !== requestRef.current.id)
@@ -1448,8 +1611,26 @@ export default function Home() {
             ? e.message
             : "数据源暂不可用",
       );
+      // 失败退避：60 秒后再自动重试，避免每秒无限重试导致 loading 弹跳
+      setNextRefreshAt(Date.now() + 60000);
     } finally {
       if (requestId === requestRef.current.id) setLoading(false);
+    }
+  };
+  const switchSat = async (s: SatSource) => {
+    if (s === satSource) return;
+    setSatSource(s);
+    setSatError(false);
+    setAnimPlaying(false);
+    setAnimFrame(0);
+    try {
+      const info = await getSatelliteInfo(s, loc.lat, loc.lon);
+      setSatInfo(info);
+      // 切换源时也更新多帧数据
+      const fs = await getSatelliteFrames(s, loc.lat, loc.lon);
+      if (!requestRef.current.controller?.signal.aborted) setSatFrames(fs);
+    } catch {
+      setSatError(true);
     }
   };
   useEffect(() => {
@@ -1460,6 +1641,14 @@ export default function Home() {
     const id = setInterval(() => setClock(Date.now()), 1000);
     return () => clearInterval(id);
   }, []);
+  // 卫星云图动画间隔
+  useEffect(() => {
+    if (!animPlaying || satFrames.length < 2) return;
+    const id = setInterval(() => {
+      setAnimFrame((v) => (v + 1) % satFrames.length);
+    }, 800);
+    return () => clearInterval(id);
+  }, [animPlaying, satFrames.length]);
   useEffect(() => {
     if (clock !== null && clock >= nextRefreshAt && !loading) load();
   }, [clock, nextRefreshAt, loading]);
@@ -1502,47 +1691,49 @@ export default function Home() {
           0,
         )
       : 0,
-    cover = demoCb
-      ? [75, 55, 35]
-      : [
-          Number(hourly?.cloud_cover_low?.[idx] || 0),
-          Number(hourly?.cloud_cover_mid?.[idx] || 0),
-          Number(hourly?.cloud_cover_high?.[idx] || 0),
-        ],
-    totalCloud = Math.round(
-      100 * (1 - (1 - cover[0] / 100) * (1 - cover[1] / 100) * (1 - cover[2] / 100)),
-    ),
-    visibility = demoCb ? 12000 : Number(hourly?.visibility?.[idx] || 15000),
     stationElevation = Number(data?.weather.elevation || 500),
-    heights = demoCb
-      ? [1.5, 6.2, 12]
-      : [
-          Math.max(
-            0.5,
-            (Number(hourly?.geopotential_height_850hPa?.[idx] || 2000) -
-              stationElevation) /
-              1000,
-          ),
-          Math.max(
-            3,
-            (Number(hourly?.geopotential_height_500hPa?.[idx] || 6000) -
-              stationElevation) /
-              1000,
-          ),
-          Math.max(
-            7,
-            (Number(hourly?.geopotential_height_250hPa?.[idx] || 10800) -
-              stationElevation) /
-              1000,
-          ),
-        ],
-    aod = demoCb ? 0.35 : Number(hourly?.aerosol_optical_depth?.[idx] || 0.2),
-    pm25 = Number(hourly?.pm2_5?.[idx] || 0),
+    pm25 = Number(hourly?.pm2_5?.[idx] || 0);
+  let cover = [
+      Number(hourly?.cloud_cover_low?.[idx] || 0),
+      Number(hourly?.cloud_cover_mid?.[idx] || 0),
+      Number(hourly?.cloud_cover_high?.[idx] || 0),
+    ],
+    visibility = Number(hourly?.visibility?.[idx] || 15000),
+    heights = [
+      Math.max(
+        0.5,
+        (Number(hourly?.geopotential_height_850hPa?.[idx] || 2000) -
+          stationElevation) /
+          1000,
+      ),
+      Math.max(
+        3,
+        (Number(hourly?.geopotential_height_500hPa?.[idx] || 6000) -
+          stationElevation) /
+          1000,
+      ),
+      Math.max(
+        7,
+        (Number(hourly?.geopotential_height_250hPa?.[idx] || 10800) -
+          stationElevation) /
+          1000,
+      ),
+    ],
+    aod = Number(hourly?.aerosol_optical_depth?.[idx] || 0.2),
     scaleHeight = Math.max(
       0.5,
       Math.min(4, Number(hourly?.boundary_layer_height?.[idx] || 1500) / 1000),
-    ),
-    effectiveGround = Math.max(
+    );
+  // 积雨云虚拟演示：注入强对流虚拟数据。覆盖发生在评分计算之前，
+  // 使取景场景、左侧云层栏、右侧受光评分共用同一套值，保证联动更新。
+  if (demoCb) {
+    cover = [75, 55, 35];
+    heights = [4.5, 9, 12];
+    aod = 0.35;
+    visibility = 12000;
+    scaleHeight = 1.5;
+  }
+  const effectiveGround = Math.max(
       0,
       scaleHeight * Math.log(Math.max(0.001, aod) / (0.02 * scaleHeight)),
     ),
@@ -1571,14 +1762,45 @@ export default function Home() {
         Number(f.hourly?.cloud_cover_high?.[ci] || 0),
       ];
     }),
+    // 光路剖面：沿太阳方位细粒度云量（供「光路」视图）
+    sunPathCover = (data?.sunPath?.forecasts || []).map((f) => {
+      const times = f.hourly?.time || [],
+        ci = times.length
+          ? times.reduce(
+              (best, t, i) =>
+                Math.abs(
+                  new Date(String(t) + "+08:00").getTime() - date.getTime(),
+                ) <
+                Math.abs(
+                  new Date(String(times[best]) + "+08:00").getTime() -
+                    date.getTime(),
+                )
+                  ? i
+                  : best,
+              0,
+            )
+          : 0;
+      return [
+        Number(f.hourly?.cloud_cover_low?.[ci] || 0),
+        Number(f.hourly?.cloud_cover_mid?.[ci] || 0),
+        Number(f.hourly?.cloud_cover_high?.[ci] || 0),
+      ];
+    }),
     edgeAt = corridorCover.findIndex((c, i) => i > 0 && c[targetIndex] < 15),
     cloudEdge =
       edgeAt > 0
         ? data?.corridor?.distances[edgeAt] || 320
         : data?.corridor?.distances.at(-1) || 320,
     maxDepth = 2 * Math.sqrt(2 * 6371 * effectiveHeights[targetIndex]),
+    // 阴天遮光因子（供 illum 受光判断和评分用）
+    parentOvercast = calcOvercast(cover, Number(hourly?.precipitation?.[idx] || 0), visibility),
     illum = effectiveHeights.map(
-      (h, i) => solar.altitude > -dip(h) - 0.57 && cover[i] > 5,
+      (h, i) =>
+        solar.altitude > -dip(h) - 0.57 &&
+        cover[i] > 5 &&
+        // 阴天遮光：低云量>70%+降水 或 overcast>0.5 时，云层不受光
+         !(i === 0 && parentOvercast > 0.4) &&
+         !(parentOvercast > 0.65),
     ),
     lowerBlock = corridorCover.length
       ? corridorCover
@@ -1648,15 +1870,139 @@ export default function Home() {
     ],
     modelSpread = Math.round(
       comparisonCover.reduce((s, v, i) => s + Math.abs(v - cover[i]), 0) / 3,
+    );
+  let cape = Number(comparisonHourly?.cape?.[comparisonIdx] || 0),
+    precipitation = Number(
+      comparisonHourly?.precipitation?.[comparisonIdx] || 0,
     ),
-    cape = demoCb ? 1200 : Number(comparisonHourly?.cape?.[comparisonIdx] || 0),
-    precipitation = demoCb
-      ? 0.8
-      : Number(comparisonHourly?.precipitation?.[comparisonIdx] || 0),
-    wind500 = demoCb
-      ? 30
-      : Number(comparisonHourly?.wind_speed_500hPa?.[comparisonIdx] || 20),
-    genus = classifyGenus({
+    wind500 = Number(
+      comparisonHourly?.wind_speed_500hPa?.[comparisonIdx] || 20,
+    );
+  // 阵风与多层风场（阵风/风切变面板）
+  const gust10 = Number(comparisonHourly?.wind_gusts_10m?.[comparisonIdx] || 0),
+    wind10 = Number(comparisonHourly?.wind_speed_10m?.[comparisonIdx] || 0),
+    dir10 = Number(comparisonHourly?.wind_direction_10m?.[comparisonIdx] || 0),
+    wind850 = Number(comparisonHourly?.wind_speed_850hPa?.[comparisonIdx] || 0),
+    dir850 = Number(comparisonHourly?.wind_direction_850hPa?.[comparisonIdx] || 0),
+    dir500 = Number(comparisonHourly?.wind_direction_500hPa?.[comparisonIdx] || 0),
+    wind250 = Number(comparisonHourly?.wind_speed_250hPa?.[comparisonIdx] || 0),
+    dir250 = Number(comparisonHourly?.wind_direction_250hPa?.[comparisonIdx] || 0),
+    // 风矢量分解：u=东向分量(顺风向 sin)，v=北向分量(cos)
+    windVec = (spd: number, dir: number) => ({
+      u: spd * Math.sin((dir * Math.PI) / 180),
+      v: spd * Math.cos((dir * Math.PI) / 180),
+    }),
+    // 垂直风切变：850→500 hPa（中高层）与 10m→850 hPa（低层）矢量差
+    shearMid = (() => {
+      const a = windVec(wind850, dir850),
+        b = windVec(wind500, dir500);
+      return Math.hypot(a.u - b.u, a.v - b.v);
+    })(),
+    shearLow = (() => {
+      const a = windVec(wind10, dir10),
+        b = windVec(wind850, dir850);
+      return Math.hypot(a.u - b.u, a.v - b.v);
+    })();
+  // 云动态外推：基于当前低层风场，线性推测从现在到日出/日落，云会移动到哪个位置
+  // 移动距离 = 平均风速 × 剩余时间（小时）
+  const now = new Date();
+  const targetTime = event || date;
+  const hoursToGo = Math.max(0, (targetTime.getTime() - now.getTime()) / (1000 * 3600));
+  // 使用 850hPa 风向风速（主导云系移动），如果没有数据则用 10m 风
+  // Open-Meteo wind_direction 为「来向」（风从哪个方向吹来）；
+  // 云团实际移动方向（去向）= 来向 + 180°，否则外推终点会指向云团来源而非去向
+  const windFrom = wind850 > 5 ? dir850 : dir10,
+    advectionDir = (windFrom + 180) % 360,
+    advectionSpeed = wind850 > 5 ? wind850 : Math.max(5, wind10),
+    totalKm = advectionSpeed * hoursToGo;
+  // 计算云移动终点：当前位置沿风向移动 totalKm
+  const [cloudEndLat, cloudEndLon] = destination(loc.lat, loc.lon, advectionDir, totalKm);
+  // 计算相对于视线方向（bearing）的云移动：云从哪个方向来，会移向观测点哪边？
+  // bearing = 用户当前视线方向（朝向日落/日出）
+  // 相对方位：将 advectionDir 转为相对于 bearing 的角度
+  const relDir = ((advectionDir - bearing) + 180 + 360) % 360 - 180;
+  let cloudMoveDesc = "";
+  if (Math.abs(relDir) < 30) {
+    cloudMoveDesc = "云团从前方移入，逐渐接近观测点";
+  } else if (Math.abs(relDir) > 150) {
+    cloudMoveDesc = "云团向后方移出，逐渐离开观测区域";
+  } else if (relDir > -90 && relDir < 0) {
+    cloudMoveDesc = "云团向左侧移动，从右向左经过";
+  } else if (relDir > 0 && relDir < 90) {
+    cloudMoveDesc = "云团向右侧移动，从左向右经过";
+  } else if (relDir <= -90) {
+    cloudMoveDesc = "云团向左侧后方移动";
+  } else {
+    cloudMoveDesc = "云团向右侧后方移动";
+  }
+  // 云量变化趋势：从现在到目标时刻，云量会如何变化？
+  let cloudTrend = 0, trendLabel = "";
+  if (hourly?.cloud_cover && evolveIdx0 >= 2 && evolveIdx0 < (hourly.cloud_cover.length - 2)) {
+    const nowCover = Number(hourly.cloud_cover[evolveIdx0] || 50);
+    const futureCover = Number(hourly.cloud_cover[Math.min(hourly.cloud_cover.length - 1, evolveIdx0 + Math.max(1, Math.round(hoursToGo)))] || nowCover);
+    cloudTrend = futureCover - nowCover;
+    trendLabel = cloudTrend > 15 ? "云量逐渐增多，霞光机会↓" :
+                 cloudTrend < -15 ? "云量逐渐减少，霞光机会↑" :
+                 "云量基本稳定，变化不大";
+  }
+  // 云量演变曲线：以日出/日落时刻为中心，展示前后各 12h 的低/中/高云量趋势
+  const evolveTimes = hourly?.time || [],
+    evolveIdx0 = hourly
+      ? hourly.time.reduce(
+          (best, t, i) => {
+            const tt = new Date(String(t) + "+08:00").getTime(),
+              ev = event ? event.getTime() : date.getTime();
+            return Math.abs(tt - ev) <
+              Math.abs(
+                new Date(String(hourly.time[best]) + "+08:00").getTime() - ev,
+              )
+              ? i
+              : best;
+          },
+          0,
+        )
+      : 0,
+    evolveStart = Math.max(0, evolveIdx0 - 6),
+    evolveEnd = Math.min(evolveTimes.length - 1, evolveIdx0 + 18),
+    evolveN = Math.max(1, evolveEnd - evolveStart),
+    evolveSeries = [0, 1, 2].map((li) =>
+      (hourly?.[["cloud_cover_low", "cloud_cover_mid", "cloud_cover_high"][li]] ||
+        []
+      ).slice(evolveStart, evolveEnd + 1),
+    ),
+    // 风向 16 方位标签
+    dirLabel = (d: number) => {
+      const dirs = [
+        "北",
+        "北东北",
+        "东北",
+        "东东北",
+        "东",
+        "东东南",
+        "东南",
+        "南东南",
+        "南",
+        "南西南",
+        "西南",
+        "西西南",
+        "西",
+        "西西北",
+        "西北",
+        "北西北",
+      ];
+      return dirs[Math.round(d / 22.5) % 16];
+    },
+    // 风切变定性
+    shearLabel = (s: number) =>
+      s < 8 ? "弱" : s < 16 ? "中" : "强",
+    shearTone = (s: number) =>
+      s < 8 ? "#7fae8f" : s < 16 ? "#e0b36a" : "#e07a6a";
+  if (demoCb) {
+    cape = 1200;
+    precipitation = 0.8;
+    wind500 = 30;
+  }
+  const genus = classifyGenus({
       cape,
       precipitation,
       wind: wind500,
@@ -1671,7 +2017,9 @@ export default function Home() {
       [cover[0], cover[1], cover[2]],
       precipitation,
     ),
-    deterministicProbability = Math.min(
+    phaseLabel = { liquid: "液态", mixed: "混合相", ice: "冰相" } as const,
+    precipLabel = { none: "无降水", rain: "雨", snow: "雪", mixed: "雨夹雪" } as const;
+  const deterministicProbability = Math.min(
       99,
       Math.round(
         geometryScore * 0.45 + cloudScore * 0.35 + corridorScore * 0.2,
@@ -1751,7 +2099,7 @@ export default function Home() {
       ),
     ),
     scenario = demoCb
-      ? "积雨云虚拟演示"
+      ? "积雨云 Cb"
       : cape > 700
         ? "对流云边缘型"
         : cover[2] > 58 && cover[1] < 48
@@ -1761,8 +2109,15 @@ export default function Home() {
             : cover[0] > 48
               ? "低云遮挡型"
               : "云洞漏光型",
-    phaseLabel = { liquid: "液态", mixed: "混合相", ice: "冰相" } as const,
-    precipLabel = { none: "无降水", rain: "雨", snow: "雪", mixed: "雨夹雪" } as const,
+    cloudKinds = demoCb
+      ? ["浓积云 Cu cong", "积雨云 Cb", "卷云 Ci"]
+      : [
+          cover[0] > 62 ? "层积云 Sc" : "碎层云 St",
+          scenario === "中云层状型" || cover[1] > 68
+            ? "高层云 As"
+            : "高积云 Ac",
+          cover[2] > 62 ? "卷层云 Cs" : "卷云 Ci",
+        ],
     scan = event
       ? Array.from({ length: 25 }, (_, i) => {
           const m = i * 5,
@@ -1864,14 +2219,6 @@ export default function Home() {
       day: "numeric",
       weekday: "short",
     }),
-    modelUpdateLabel = data?.modelUpdate
-      ? new Date(data.modelUpdate).toLocaleTimeString("zh-CN", {
-          timeZone: "Asia/Shanghai",
-          hour: "2-digit",
-          minute: "2-digit",
-          hour12: false,
-        })
-      : "--:--",
     selectDate = (next: string) => {
       if (!availableDates.includes(next)) return;
       setSelectedDate(next);
@@ -1882,6 +2229,198 @@ export default function Home() {
       const current = Math.max(0, availableDates.indexOf(selectedDate)),
         next = availableDates[current + offset];
       if (next) selectDate(next);
+    },
+    openCityRank = () => {
+      setCityRankOpen(true);
+      const key = `${selectedDate}|${mode}`;
+      if (cityRankKey === key && cityRanks.length) return; // 同日期同模式缓存
+      setCityRankKey(key);
+      setCityRanks([]);
+      setCityRankLoading(true);
+      setCityRankError("");
+      const day = new Date(`${selectedDate}T12:00:00+08:00`);
+      rankCities(day, mode)
+        .then((r) => setCityRanks(r.slice(0, 20)))
+        .catch(() => setCityRankError("批量评分失败，请稍后重试"))
+        .finally(() => setCityRankLoading(false));
+    },
+    pickCity = (c: CityRank) => {
+      setPlaying(false);
+      setMinute(60);
+      setCustomLocation({ lat: c.lat, lon: c.lon });
+      setPlace("地图选点");
+      setCityRankOpen(false);
+      load();
+    },
+    // 任意地名搜索：输入防抖后调用地理编码 API，展示候选列表
+    onSearchInput = (q: string) => {
+      setSearchQuery(q);
+      const id = ++searchRef.current.id;
+      searchRef.current.controller?.abort();
+      if (!q.trim()) {
+        setSearchResults([]);
+        setSearchOpen(false);
+        setSearching(false);
+        return;
+      }
+      setSearching(true);
+      setSearchOpen(true);
+      const controller = new AbortController();
+      searchRef.current.controller = controller;
+      setTimeout(() => {
+        if (searchRef.current.id !== id) return;
+        searchPlace(q.trim(), controller.signal)
+          .then((r) => {
+            if (searchRef.current.id !== id) return;
+            setSearchResults(r);
+            setSearching(false);
+          })
+          .catch(() => {
+            if (searchRef.current.id !== id) return;
+            setSearchResults([]);
+            setSearching(false);
+          });
+      }, 350);
+    },
+    // 选中搜索结果：更新坐标并联动刷新实况/预报
+    pickSearchResult = (r: GeoResult) => {
+      setPlaying(false);
+      setMinute(60);
+      setCustomLocation({ lat: r.latitude, lon: r.longitude });
+      setPlace("地图选点");
+      setSearchQuery(r.name);
+      setSearchResults([]);
+      setSearchOpen(false);
+      load();
+    },
+    clearSearch = () => {
+      setSearchQuery("");
+      setSearchResults([]);
+      setSearchOpen(false);
+      searchRef.current.controller?.abort();
+      searchRef.current.id++;
+    },
+    // 分享推荐城市图片：把 20 城拆成 2 组，分别渲染为高清 PNG（避免单张过长过紧凑），再分享/下载
+    shareCityRank = async () => {
+      // 第二次点击：已有生成好的文件，直接触发分享（手势还在）
+      if (shareFilesRef.current.length > 0) {
+        const files = shareFilesRef.current;
+        shareFilesRef.current = [];
+        setShareReady(false);
+        if (navigator.canShare?.({ files })) {
+          try {
+            await withPromiseTimeout(
+              navigator.share({ files, title: "推荐拍摄城市" }),
+              5000,
+              "share-timeout",
+            );
+          } catch (e) {
+            const msg = e instanceof Error ? e.message : "";
+            if (msg !== "share-timeout" && !(e as DOMException)?.name?.includes("Abort")) {
+              throw e;
+            }
+            for (const f of files) downloadBlob(f);
+          }
+        } else {
+          for (const f of files) downloadBlob(f);
+        }
+        return;
+      }
+      // 第一次点击：生成图片再让用户点一次分享（异步操作会丢失手势）
+      const el = document.querySelector<HTMLElement>(".cityrank-dialog");
+      if (!el || !cityRanks.length) return;
+      setCityRankSharing(true);
+      setCityRankError("");
+      // 只分享「值得专程拍摄」的城市，其余移除
+      const allItems = Array.from(
+        el.querySelectorAll<HTMLElement>(".cityrank-item"),
+      );
+      allItems.forEach((item) => {
+        const tag = item.querySelector(".cityrank-tag")?.textContent?.trim();
+        if (tag !== "值得专程拍摄") item.remove();
+      });
+      // 重新统计剩下的城市数量
+      const worthyItems = Array.from(
+        el.querySelectorAll<HTMLElement>(".cityrank-item"),
+      );
+      if (!worthyItems.length) {
+        setCityRankError("当前没有值得专程拍摄的城市");
+        setCityRankSharing(false);
+        return;
+      }
+      // 拆成 2 组：前一半 / 后一半
+      const half = Math.ceil(worthyItems.length / 2);
+      const groups = [
+        { start: 0, end: half, label: `1-${half}` },
+        { start: half, end: worthyItems.length, label: `${half + 1}-${worthyItems.length}` },
+      ];
+      const files: File[] = [];
+      try {
+        for (let gi = 0; gi < groups.length; gi++) {
+          const { start, end, label } = groups[gi];
+          const clone = el.cloneNode(true) as HTMLElement;
+          clone.style.position = "fixed";
+          clone.style.left = "-100000px";
+          clone.style.top = "0";
+          clone.style.maxHeight = "none";
+          clone.style.overflow = "visible";
+          clone.style.animation = "none";
+          const title = clone.querySelector<HTMLElement>('[data-slot="dialog-title"]');
+          if (title) title.textContent = `今日推荐拍摄城市（${label}）`;
+          clone.querySelector('[data-slot="dialog-close"]')?.remove();
+          clone.querySelector(".cityrank-share")?.remove();
+          const items = Array.from(
+            clone.querySelectorAll<HTMLElement>(".cityrank-item"),
+          );
+          items.forEach((item, idx) => {
+            if (idx < start || idx >= end) item.remove();
+          });
+          const body = clone.querySelector<HTMLElement>(".cityrank-body");
+          if (body) body.style.gap = "14px";
+          document.body.appendChild(clone);
+          try {
+            const dataUrl = await withPromiseTimeout(
+              toPng(clone, {
+                pixelRatio: 1.5,
+                backgroundColor: "#0c1719",
+                cacheBust: true,
+                style: {
+                  position: "relative",
+                  top: "auto",
+                  left: "auto",
+                  right: "auto",
+                  bottom: "auto",
+                  transform: "none",
+                  translate: "none",
+                  margin: "0",
+                },
+              }),
+              30000,
+              "截图生成超时，请重试",
+            );
+            const blob = await (await fetch(dataUrl)).blob();
+            files.push(
+              new File(
+                [blob],
+                `推荐拍摄城市-${selectedDate}-${mode === "sunset" ? "晚霞" : "朝霞"}-${gi + 1}.png`,
+                { type: "image/png" },
+              ),
+            );
+          } finally {
+            clone.remove();
+          }
+        }
+        // 生成完毕，存到 ref，让用户再点一次分享（保持手势）
+        shareFilesRef.current = files;
+        setShareReady(true);
+        setCityRankSharing(false);
+      } catch (e) {
+        setCityRankError(
+          e instanceof Error ? e.message : "分享失败，请重试",
+        );
+        setCityRankSharing(false);
+        setShareReady(false);
+      }
     };
   return (
     <main className="app-shell">
@@ -1923,7 +2462,7 @@ export default function Home() {
         </div>
       </header>
       <section className="workspace">
-        <aside className="left-panel panel">
+        <aside className={`left-panel panel${mobileSettings ? "" : " mob-collapsed"}`}>
           <div className="panel-title">
             <MapPin size={15} />
             观测位置
@@ -1941,6 +2480,60 @@ export default function Home() {
             ))}
             <option value="地图选点">地图选点</option>
           </select>
+          <div className="place-search">
+            <div className="place-search-input">
+              <Search size={14} />
+              <input
+                type="text"
+                value={searchQuery}
+                placeholder="搜索任意地名…"
+                aria-label="搜索任意地名"
+                onChange={(e) => onSearchInput(e.target.value)}
+                onFocus={() => searchQuery.trim() && setSearchOpen(true)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && searchResults.length) {
+                    pickSearchResult(searchResults[0]);
+                  }
+                  if (e.key === "Escape") {
+                    setSearchOpen(false);
+                    (e.target as HTMLInputElement).blur();
+                  }
+                }}
+              />
+              {searchQuery ? (
+                <button
+                  className="place-search-clear"
+                  aria-label="清空搜索"
+                  onClick={clearSearch}
+                >
+                  <X size={13} />
+                </button>
+              ) : null}
+            </div>
+            {searchOpen && (
+              <div className="place-search-dropdown">
+                {searching ? (
+                  <div className="place-search-empty">搜索中…</div>
+                ) : searchResults.length ? (
+                  searchResults.map((r, i) => (
+                    <button
+                      key={`${r.latitude},${r.longitude},${i}`}
+                      className="place-search-item"
+                      onClick={() => pickSearchResult(r)}
+                    >
+                      <span className="place-search-name">{r.name}</span>
+                      <span className="place-search-sub">
+                        {[r.admin2, r.admin1, r.country].filter(Boolean).join(" · ") ||
+                          `${r.latitude.toFixed(2)}°, ${r.longitude.toFixed(2)}°`}
+                      </span>
+                    </button>
+                  ))
+                ) : (
+                  <div className="place-search-empty">未找到匹配地点</div>
+                )}
+              </div>
+            )}
+          </div>
           <div className="coords">
             <span>{loc.lat.toFixed(4)}°N</span>
             <span>{loc.lon.toFixed(4)}°E</span>
@@ -1980,27 +2573,23 @@ export default function Home() {
                 <ChevronRight size={15} />
               </button>
             </div>
-            <small>{selectedDateLabel} · 回溯 {HISTORY_DAYS} 天 · 未来 7 天</small>
+            <small>{selectedDateLabel} · 未来 7 天</small>
           </div>
           <button className="location-btn" onClick={load}>
             <RefreshCw size={15} className={loading ? "spin" : ""} />
             {loading ? "正在读取真实数据" : "刷新实况/预报"}
           </button>
           <button
-            className={`demo-btn ${demoCb ? "active" : ""}`}
-            onClick={() => {
-              setDemoCb((v) => !v);
-              setVisible([true, true, true]);
-              setSceneView("view");
-            }}
-            aria-pressed={demoCb}
+            className="location-btn"
+            style={{ marginTop: 6 }}
+            onClick={openCityRank}
           >
-            <CloudSun size={15} />
-            {demoCb ? "积雨云演示中 · 点击退出" : "积雨云虚拟演示"}
+            <Trophy size={15} className={cityRankLoading ? "spin" : ""} />
+            {cityRankLoading ? "评分计算中…" : "推荐拍摄城市"}
           </button>
           <div className="data-clock">
             <span>当前 {clock === null ? "--:--:--" : new Date(clock).toLocaleTimeString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false })}</span>
-            <span title="ECMWF 数值预报更新时次">数据更新 {modelUpdateLabel}</span>
+            <span>更新 {updatedAt ? new Date(updatedAt).toLocaleTimeString("zh-CN", { timeZone: "Asia/Shanghai", hour: "2-digit", minute: "2-digit" }) : "--:--"}</span>
             <b>下次刷新 {clock === null ? "--" : `${Math.max(0, Math.ceil((nextRefreshAt - clock) / 1000))} 秒`}</b>
           </div>
           {error && <p className="error">{error}</p>}
@@ -2040,67 +2629,559 @@ export default function Home() {
           ))}
           <div className="cloudsat-strip">
             <div className="panel-subtitle">
-              <Radar size={13} />
+              <Activity size={13} />
               CloudSat 云剖面 · 垂直结构
+              <small>2B-CLDCLASS</small>
+              <button
+                type="button"
+                className="cloudsat-zoom"
+                onClick={() => setCloudsatZoom(true)}
+                aria-label="放大 CloudSat 云剖面"
+              >
+                <Maximize2 size={11} />
+                放大
+              </button>
             </div>
-            <svg viewBox="0 0 300 118" className="cloudsat-svg" role="img" aria-label="CloudSat 式云剖面">
+            <svg
+              viewBox="0 0 320 168"
+              className="cloudsat-svg"
+              role="img"
+              aria-label="CloudSat 式云剖面"
+              onClick={() => setCloudsatZoom(true)}
+              style={{ cursor: "zoom-in" }}
+            >
+              {/* 高度刻度：0–13 km，CloudSat CPR 毫米波雷达垂直剖面 */}
+              <text x="26" y="8" fill="#5f7470" fontSize="7" letterSpacing="0.12em">
+                高度 km
+              </text>
               {[0, 3, 6, 9, 12].map((km) => {
-                const yy = 8 + ((13 - km) / 13) * 90;
+                const yy = 16 + ((13 - km) / 13) * 120;
                 return (
                   <g key={km}>
-                    <line x1="0" y1={yy} x2="300" y2={yy} stroke="rgba(120,140,150,0.12)" />
-                    <text x="2" y={yy + 3} fill="#7f9390" fontSize="7">
+                    <line
+                      x1="26"
+                      y1={yy}
+                      x2="318"
+                      y2={yy}
+                      stroke="rgba(120,140,150,0.14)"
+                      strokeDasharray={km === 0 ? undefined : "2 3"}
+                    />
+                    <text x="22" y={yy + 3} fill="#7f9390" fontSize="8" textAnchor="end">
                       {km}
                     </text>
                   </g>
                 );
               })}
               {cloudProfileData.map((p, i) => {
-                const cx = [52, 150, 248][i],
-                  topY = 8 + ((13 - Math.min(13, p.top)) / 13) * 90,
-                  baseY = 8 + ((13 - Math.max(0, p.base)) / 13) * 90,
-                  colH = Math.max(4, baseY - topY),
-                  fill =
-                    p.phase === "ice"
-                      ? "rgba(232,240,248,0.72)"
-                      : p.phase === "mixed"
-                        ? "rgba(205,214,222,0.6)"
-                        : "rgba(158,176,189,0.55)";
+                const cx = [70, 160, 250][i],
+                  topY = 16 + ((13 - Math.min(13, p.top)) / 13) * 120,
+                  baseY = 16 + ((13 - Math.max(0, p.base)) / 13) * 120,
+                  colH = Math.max(6, baseY - topY),
+                  // 云属基准暖色：统一取自共享比色模块（依据文档比色卡分级），
+                  // 高云金黄、中云橘黄、低云橘红、厚云深橘红。
+                  // 阴天时褪为灰白
+                  genusTone = GENUS_TONE[p.genus] || [240, 132, 80],
+                  fadedGt = parentOvercast > 0.3
+                    ? [
+                        genusTone[0] + (140 - genusTone[0]) * parentOvercast,
+                        genusTone[1] + (148 - genusTone[1]) * parentOvercast,
+                        genusTone[2] + (155 - genusTone[2]) * parentOvercast,
+                      ].map(Math.round)
+                    : genusTone,
+                  fill = `rgba(${fadedGt.join(",")},${
+                    p.phase === "ice" ? 0.75 - parentOvercast * 0.2 : p.phase === "mixed" ? 0.62 - parentOvercast * 0.15 : 0.56 - parentOvercast * 0.12
+                  })`;
                 return (
                   <g key={i} opacity={visible[i] ? 1 : 0.3}>
                     {p.precip !== "none" && (
                       <line
                         x1={cx}
                         y1={baseY}
-                        x2={cx + (p.precip === "snow" ? 3 : 2)}
-                        y2={baseY + 15}
+                        x2={cx + (p.precip === "snow" ? 4 : 3)}
+                        y2={baseY + 16}
                         stroke={
                           p.precip === "snow"
-                            ? "rgba(220,232,240,0.5)"
+                            ? "rgba(220,232,240,0.55)"
                             : "rgba(120,140,160,0.5)"
                         }
                         strokeWidth="1.4"
                         strokeDasharray={p.precip === "snow" ? "2 2" : undefined}
                       />
                     )}
-                    <rect x={cx - 16} y={topY} width="32" height={colH} rx="4" fill={fill} />
-                    <text x={cx} y={baseY + 14} fill="#9db0ac" fontSize="7" textAnchor="middle">
+                    <rect
+                      x={cx - 18}
+                      y={topY}
+                      width="36"
+                      height={colH}
+                      rx="5"
+                      fill={fill}
+                    />
+                    {/* 柱顶受光高光：与 3D 取景一致的"金顶" */}
+                    <rect
+                      x={cx - 18}
+                      y={topY}
+                      width="36"
+                      height={Math.min(7, colH * 0.22)}
+                      rx="5"
+                      fill="rgba(255,232,196,0.4)"
+                    />
+                    <text
+                      x={cx}
+                      y={Math.max(12, topY - 4)}
+                      fill="#eef4f6"
+                      fontSize="9"
+                      fontWeight="600"
+                      textAnchor="middle"
+                    >
                       {p.type}
+                    </text>
+                    <text
+                      x={cx}
+                      y={Math.max(22, topY - 4 + 10)}
+                      fill="#7f9390"
+                      fontSize="7.5"
+                      textAnchor="middle"
+                    >
+                      {p.base.toFixed(1)}–{p.top.toFixed(1)}km
                     </text>
                   </g>
                 );
               })}
-              <line x1="0" y1={98} x2="300" y2={98} stroke="rgba(255,214,160,0.35)" strokeDasharray="3 3" />
-              <text x="300" y="111" fill="#7f9390" fontSize="7" textAnchor="end">
-                高度 km
-              </text>
+              {/* 图例：水相 + 降水 */}
+              <g>
+                <line x1="26" y1="150" x2="318" y2="150" stroke="rgba(120,140,150,0.18)" />
+                <rect x="26" y="156" width="10" height="10" rx="2" fill="rgba(232,240,248,0.6)" />
+                <text x="40" y="164" fill="#9db0ac" fontSize="8">
+                  冰相
+                </text>
+                <rect x="78" y="156" width="10" height="10" rx="2" fill="rgba(205,214,222,0.55)" />
+                <text x="92" y="164" fill="#9db0ac" fontSize="8">
+                  混合
+                </text>
+                <rect x="130" y="156" width="10" height="10" rx="2" fill="rgba(158,176,189,0.55)" />
+                <text x="144" y="164" fill="#9db0ac" fontSize="8">
+                  液态
+                </text>
+                <line x1="188" y1="161" x2="204" y2="161" stroke="rgba(120,140,160,0.6)" strokeWidth="1.6" />
+                <text x="208" y="164" fill="#9db0ac" fontSize="8">
+                  雨
+                </text>
+                <line x1="238" y1="161" x2="254" y2="161" stroke="rgba(220,232,240,0.6)" strokeWidth="1.6" strokeDasharray="2 2" />
+                <text x="258" y="164" fill="#9db0ac" fontSize="8">
+                  雪
+                </text>
+              </g>
             </svg>
           </div>
+          {/* CloudSat 云剖面放大弹窗：大尺寸垂直结构图 */}
+          <Dialog open={cloudsatZoom} onOpenChange={setCloudsatZoom}>
+            <DialogContent className="cloudsat-dialog sm:max-w-[760px]">
+              <DialogHeader className="cloudsat-dialog-header">
+                <DialogTitle>CloudSat 云剖面 · 垂直结构</DialogTitle>
+                <DialogDescription>
+                  CloudSat CPR 毫米波雷达垂直剖面思路 · 2B-CLDCLASS 云分类 · 云底/云顶/厚度/水相/降水
+                </DialogDescription>
+              </DialogHeader>
+              <svg viewBox="0 0 680 360" className="cloudsat-dialog-svg" role="img" aria-label="CloudSat 云剖面放大图">
+                <text x="58" y="22" fill="#5f7470" fontSize="13" letterSpacing="0.12em" textAnchor="end">
+                  高度 km
+                </text>
+                {[0, 3, 6, 9, 12].map((km) => {
+                  const yy = 34 + ((13 - km) / 13) * 250;
+                  return (
+                    <g key={km}>
+                      <line
+                        x1="64"
+                        y1={yy}
+                        x2="664"
+                        y2={yy}
+                        stroke="rgba(120,140,150,0.16)"
+                        strokeDasharray={km === 0 ? undefined : "3 4"}
+                      />
+                      <text x="58" y={yy + 5} fill="#7f9390" fontSize="13" textAnchor="end">
+                        {km}
+                      </text>
+                    </g>
+                  );
+                })}
+                {cloudProfileData.map((p, i) => {
+                  const cx = [170, 340, 510][i],
+                    topY = 34 + ((13 - Math.min(13, p.top)) / 13) * 250,
+                    baseY = 34 + ((13 - Math.max(0, p.base)) / 13) * 250,
+                    colH = Math.max(8, baseY - topY),
+                    // 云属基准暖色：统一取自共享比色模块（依据文档比色卡分级）
+                    // 阴天时褪为灰白
+                    genusTone = GENUS_TONE[p.genus] || [240, 132, 80],
+                    fadedGt = parentOvercast > 0.3
+                      ? [
+                          genusTone[0] + (140 - genusTone[0]) * parentOvercast,
+                          genusTone[1] + (148 - genusTone[1]) * parentOvercast,
+                          genusTone[2] + (155 - genusTone[2]) * parentOvercast,
+                        ].map(Math.round)
+                      : genusTone,
+                    fill = `rgba(${fadedGt.join(",")},${
+                      p.phase === "ice" ? 0.78 - parentOvercast * 0.2 : p.phase === "mixed" ? 0.66 - parentOvercast * 0.15 : 0.6 - parentOvercast * 0.12
+                    })`;
+                  return (
+                    <g key={i} opacity={visible[i] ? 1 : 0.3}>
+                      {p.precip !== "none" && (
+                        <line
+                          x1={cx}
+                          y1={baseY}
+                          x2={cx + (p.precip === "snow" ? 8 : 6)}
+                          y2={baseY + 34}
+                          stroke={
+                            p.precip === "snow"
+                              ? "rgba(220,232,240,0.6)"
+                              : "rgba(120,140,160,0.55)"
+                          }
+                          strokeWidth="2.4"
+                          strokeDasharray={p.precip === "snow" ? "4 4" : undefined}
+                        />
+                      )}
+                      <rect x={cx - 48} y={topY} width="96" height={colH} rx="10" fill={fill} />
+                      <rect
+                        x={cx - 48}
+                        y={topY}
+                        width="96"
+                        height={Math.min(14, colH * 0.2)}
+                        rx="10"
+                        fill="rgba(255,232,196,0.42)"
+                      />
+                      <text
+                        x={cx}
+                        y={Math.max(30, topY - 10)}
+                        fill="#eef4f6"
+                        fontSize="17"
+                        fontWeight="600"
+                        textAnchor="middle"
+                      >
+                        {p.type}
+                      </text>
+                      <text
+                        x={cx}
+                        y={Math.max(52, topY - 10 + 22)}
+                        fill="#7f9390"
+                        fontSize="13"
+                        textAnchor="middle"
+                      >
+                        底{p.base.toFixed(1)}–顶{p.top.toFixed(1)}km · 厚
+                        {p.thickness.toFixed(1)}km
+                      </text>
+                      <text
+                        x={cx}
+                        y={Math.max(74, topY - 10 + 44)}
+                        fill="#9db0ac"
+                        fontSize="12"
+                        textAnchor="middle"
+                      >
+                        {phaseLabel[p.phase]} · {precipLabel[p.precip]} · 云量
+                        {Math.round(p.cover)}%
+                      </text>
+                    </g>
+                  );
+                })}
+                {/* 图例：水相 + 降水 */}
+                <g>
+                  <line x1="64" y1="312" x2="664" y2="312" stroke="rgba(120,140,150,0.2)" />
+                  <rect x="64" y="320" width="14" height="14" rx="3" fill="rgba(232,240,248,0.6)" />
+                  <text x="84" y="331" fill="#9db0ac" fontSize="12">
+                    冰相
+                  </text>
+                  <rect x="130" y="320" width="14" height="14" rx="3" fill="rgba(205,214,222,0.55)" />
+                  <text x="150" y="331" fill="#9db0ac" fontSize="12">
+                    混合
+                  </text>
+                  <rect x="196" y="320" width="14" height="14" rx="3" fill="rgba(158,176,189,0.55)" />
+                  <text x="216" y="331" fill="#9db0ac" fontSize="12">
+                    液态
+                  </text>
+                  <line x1="272" y1="327" x2="294" y2="327" stroke="rgba(120,140,160,0.65)" strokeWidth="2.4" />
+                  <text x="300" y="331" fill="#9db0ac" fontSize="12">
+                    雨
+                  </text>
+                  <line x1="336" y1="327" x2="358" y2="327" stroke="rgba(220,232,240,0.65)" strokeWidth="2.4" strokeDasharray="3 3" />
+                  <text x="364" y="331" fill="#9db0ac" fontSize="12">
+                    雪
+                  </text>
+                  <text x="664" y="331" fill="#5f7470" fontSize="11" textAnchor="end">
+                    CloudSat CPR 垂直剖面 · 2B-CLDCLASS
+                  </text>
+                </g>
+              </svg>
+            </DialogContent>
+          </Dialog>
+          {/* 云量演变曲线：以日出/日落时刻为中心的未来 24h 云量趋势 */}
+          <div className="divider" />
+          <div className="panel-title">
+            <TrendingUp size={15} />
+            云量演变
+            <small>以{mode === "sunset" ? "日落" : "日出"}为中心 ±12h</small>
+          </div>
+          {hasData && evolveTimes.length ? (
+            <svg
+              viewBox="0 0 320 118"
+              className="evolve-svg"
+              role="img"
+              aria-label="云量演变曲线"
+            >
+              {/* 网格线 */}
+              {[0, 25, 50, 75, 100].map((v) => {
+                const yy = 12 + (1 - v / 100) * 86;
+                return (
+                  <g key={v}>
+                    <line
+                      x1="34"
+                      y1={yy}
+                      x2="314"
+                      y2={yy}
+                      stroke="rgba(120,140,150,0.14)"
+                      strokeDasharray="2 3"
+                    />
+                    <text x="30" y={yy + 3} fill="#7f9390" fontSize="7" textAnchor="end">
+                      {v}
+                    </text>
+                  </g>
+                );
+              })}
+              {/* 事件时刻竖线（日落/日出） */}
+              {(() => {
+                const ex = 34 + ((evolveIdx0 - evolveStart) / evolveN) * 280;
+                return (
+                  <g>
+                    <line
+                      x1={ex}
+                      y1="12"
+                      x2={ex}
+                      y2="98"
+                      stroke="rgba(255,200,130,0.55)"
+                      strokeWidth="1"
+                      strokeDasharray="3 3"
+                    />
+                    <text
+                      x={ex}
+                      y="8"
+                      fill="rgba(255,210,150,0.85)"
+                      fontSize="7"
+                      textAnchor="middle"
+                    >
+                      {mode === "sunset" ? "日落" : "日出"}
+                    </text>
+                  </g>
+                );
+              })()}
+              {/* 三层云量曲线 */}
+              {[
+                { key: "low", color: "#7a8798", label: "低" },
+                { key: "mid", color: "#d87778", label: "中" },
+                { key: "high", color: "#f3c293", label: "高" },
+              ].map((s, li) => {
+                const pts = evolveSeries[li]
+                  .map((v, i) => {
+                    const x = 34 + (i / evolveN) * 280,
+                      y = 12 + (1 - Math.min(100, Math.max(0, v)) / 100) * 86;
+                    return `${i ? "L" : "M"}${x.toFixed(1)},${y.toFixed(1)}`;
+                  })
+                  .join(" ");
+                return (
+                  <g key={s.key}>
+                    <path
+                      d={pts}
+                      fill="none"
+                      stroke={s.color}
+                      strokeWidth="1.6"
+                      strokeLinejoin="round"
+                      strokeLinecap="round"
+                    />
+                    {/* 曲线末点小圆 */}
+                    {evolveSeries[li].length ? (
+                      <circle
+                        cx={34 + ((evolveSeries[li].length - 1) / evolveN) * 280}
+                        cy={
+                          12 +
+                          (1 -
+                            Math.min(
+                              100,
+                              Math.max(
+                                0,
+                                evolveSeries[li][evolveSeries[li].length - 1],
+                              ),
+                            ) /
+                              100) *
+                            86
+                        }
+                        r="2"
+                        fill={s.color}
+                      />
+                    ) : null}
+                  </g>
+                );
+              })}
+              {/* 时间刻度 */}
+              {[0, 6, 12, 18, 24].map((h) => {
+                const i = Math.min(evolveN, Math.round((h / 24) * evolveN)),
+                  t = evolveTimes[evolveStart + i];
+                if (!t) return null;
+                const hh = String(t).slice(11, 13);
+                return (
+                  <text
+                    key={h}
+                    x={34 + (i / evolveN) * 280}
+                    y="108"
+                    fill="#7f9390"
+                    fontSize="7"
+                    textAnchor="middle"
+                  >
+                    {hh}时
+                  </text>
+                );
+              })}
+              {/* 图例 */}
+              <g>
+                {[
+                  { c: "#7a8798", l: "低云" },
+                  { c: "#d87778", l: "中云" },
+                  { c: "#f3c293", l: "高云" },
+                ].map((s, i) => (
+                  <g key={s.l} transform={`translate(${150 + i * 58}, 112)`}>
+                    <line x1="0" y1="0" x2="14" y2="0" stroke={s.c} strokeWidth="2" />
+                    <text x="18" y="3" fill="#9db0ac" fontSize="7">
+                      {s.l}
+                    </text>
+                  </g>
+                ))}
+              </g>
+            </svg>
+          ) : (
+            <p className="error">云量演变数据尚未载入</p>
+          )}
+          {/* 阵风 / 风切变 */}
+          <div className="divider" />
+          <div className="panel-title">
+            <Wind size={15} />
+            阵风 / 风切变
+            <small>ECMWF 多层风场</small>
+          </div>
+          <div className="wind-grid">
+            <div>
+              <small>10m 阵风</small>
+              <b>{hasData ? gust10.toFixed(0) : "--"}</b>
+              <em>km/h</em>
+            </div>
+            <div>
+              <small>10m 风</small>
+              <b>{hasData ? wind10.toFixed(0) : "--"}</b>
+              <em>{hasData ? dirLabel(dir10) : ""}</em>
+            </div>
+            <div>
+              <small>850hPa</small>
+              <b>{hasData ? wind850.toFixed(0) : "--"}</b>
+              <em>{hasData ? dirLabel(dir850) : ""}</em>
+            </div>
+            <div>
+              <small>500hPa</small>
+              <b>{hasData ? wind500.toFixed(0) : "--"}</b>
+              <em>{hasData ? dirLabel(dir500) : ""}</em>
+            </div>
+            <div>
+              <small>250hPa</small>
+              <b>{hasData ? wind250.toFixed(0) : "--"}</b>
+              <em>{hasData ? dirLabel(dir250) : ""}</em>
+            </div>
+          </div>
+          <div className="shear-box">
+            <div>
+              <span>低层切变 10m→850hPa</span>
+              <i>
+                <b
+                  style={{
+                    width: `${Math.min(100, (shearLow / 30) * 100)}%`,
+                    background: shearTone(shearLow),
+                  }}
+                />
+              </i>
+              <em style={{ color: shearTone(shearLow) }}>
+                {hasData ? `${shearLabel(shearLow)} ${shearLow.toFixed(0)}` : "--"}
+              </em>
+            </div>
+            <div>
+              <span>中高层切变 850→500hPa</span>
+              <i>
+                <b
+                  style={{
+                    width: `${Math.min(100, (shearMid / 30) * 100)}%`,
+                    background: shearTone(shearMid),
+                  }}
+                />
+              </i>
+              <em style={{ color: shearTone(shearMid) }}>
+                {hasData ? `${shearLabel(shearMid)} ${shearMid.toFixed(0)}` : "--"}
+              </em>
+            </div>
+          </div>
+          <p className="wind-note">
+            垂直风切变 = 两层风速矢量差（km/h）。切变强时云体易被撕裂、形态散乱；
+            切变弱时云层稳定，利于霞光持续。
+          </p>
+          {/* 云动态外推：线性推测云团移动 */}
+          <div className="divider" />
+          <div className="panel-title">
+            <Navigation size={15} />
+            云动态外推
+            <small>ECMWF 风场 → 线性推测</small>
+          </div>
+          {hasData ? (
+            <div className="advection-box">
+              <div className="adv-header">
+                <span>距{mode === "sunset" ? "日落" : "日出"}还有</span>
+                <b>{hoursToGo < 1 ? "＜1小时" : `${hoursToGo.toFixed(0)}小时${Math.round((hoursToGo % 1) * 60)}分`}</b>
+              </div>
+              <div className="adv-row">
+                <span>主导风</span>
+                <i>{dirLabel(windFrom)} {advectionSpeed.toFixed(0)} km/h</i>
+              </div>
+              <div className="adv-row">
+                <span>云移动趋势</span>
+                <i>{cloudMoveDesc}</i>
+              </div>
+              <div className="adv-row">
+                <span>云量趋势</span>
+                <i style={{ color: cloudTrend > 15 ? "#e0b36a" : cloudTrend < -15 ? "#7fae8f" : "#9db0ac" }}>
+                  {trendLabel}
+                </i>
+              </div>
+              <div className="adv-row">
+                <span>外推终点</span>
+                <i className="adv-coord">{cloudEndLat.toFixed(3)}°, {cloudEndLon.toFixed(3)}°</i>
+              </div>
+              <div className="adv-row">
+                <span>移动距离</span>
+                <i>{totalKm.toFixed(0)} km</i>
+              </div>
+              <p className="wind-note">
+                基于 850hPa 风场推测云团轨迹。云随气流移动，当前风将该云团向 {dirLabel(advectionDir)} 方向推移。
+                {hoursToGo > 1
+                  ? `预计到${mode === "sunset" ? "日落" : "日出"}时，云区将移动约 ${totalKm.toFixed(0)} km。`
+                  : `仅剩不到 1 小时，云层位置变化不大。`}
+              </p>
+            </div>
+          ) : (
+            <p className="error">风场数据尚未载入</p>
+          )}
+          <button
+            type="button"
+            className={`demo-btn${demoCb ? " active" : ""}`}
+            onClick={() => setDemoCb((v) => !v)}
+            aria-pressed={demoCb}
+          >
+            <CloudLightning size={14} />
+            {demoCb ? "积雨云虚拟演示 · 进行中" : "积雨云虚拟演示"}
+          </button>
           <div className="source-note">
             <span>实时数据链</span>
             <p>
               ECMWF IFS 分层云与辐射、Open‑Meteo 90m DEM、NOAA 太阳几何、NASA
-              VIIRS 卫星真彩色。
+              GIBS Himawari‑9 卫星云图（红外/可见光，10 分钟更新）。
             </p>
             <p>
               AOD {hasData ? aod.toFixed(2) : "--"} · PM2.5{" "}
@@ -2109,15 +3190,88 @@ export default function Home() {
               通用几何模型；AOD分级参考文档经验，四川盆地按边界层高度动态修正。
             </p>
           </div>
-          {data && (
+          {satInfo && <div>
             <div className="sat-card">
-              <div>
+              <div className="sat-head">
                 <Satellite size={14} />
-                昨日卫星云图
+                <span className="sat-title">实况卫星云图</span>
+                <span className="sat-time">
+                  {fmtObsTime(satInfo.time)}
+                </span>
               </div>
-              <img src={data.satellite} alt="NASA VIIRS 卫星真彩色云图" />
+              <div className="sat-src" role="group" aria-label="卫星数据源">
+                {(
+                  [
+                    ["hima9-ir", "Himawari-9 红外"],
+                    ["hima9-vis", "Himawari-9 可见光"],
+                    ["fy4b", "FY-4B"],
+                    ["viirs", "VIIRS"],
+                  ] as [SatSource, string][]
+                ).map(([s, label]) => (
+                  <button
+                    key={s}
+                    className={satSource === s ? "active" : ""}
+                    onClick={() => switchSat(s)}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+              {satError ? (
+                <div className="sat-fallback">卫星影像加载失败，可切换数据源重试</div>
+              ) : (
+                <img
+                  key={satInfo.url}
+                  src={satInfo.url}
+                  alt={satInfo.label}
+                  onError={() => setSatError(true)}
+                />
+              )}
             </div>
-          )}
+            {satFrames.length > 1 && <div className="sat-animate">
+              <div className="sat-animate-head">
+                <span>云动态演变 · 过去 3 小时</span>
+                <div className="sat-animate-ctrl">
+                  <button
+                    className={animPlaying ? "" : "active"}
+                    onClick={() => { setAnimPlaying(false); setAnimFrame(0); }}
+                    title="暂停"
+                  >||</button>
+                  <button
+                    className={animPlaying ? "active" : ""}
+                    onClick={() => setAnimPlaying(!animPlaying)}
+                    title="播放"
+                  >{animPlaying ? "⏸" : "▶"}</button>
+                </div>
+              </div>
+              <div className="sat-animate-track">
+                <div className="sat-animate-overlay">
+                  {satFrames.map((f, i) => (
+                    <img key={f.url} src={f.url} alt={`${f.hoursAgo}h ago`}
+                      className={i === animFrame ? "active" : ""} />
+                  ))}
+                </div>
+                <input type="range" min="0" max={satFrames.length - 1} step="1"
+                  value={animFrame}
+                  onChange={(e) => { setAnimFrame(Number(e.target.value)); setAnimPlaying(false); }}
+                  className="sat-animate-slider" />
+                <div className="sat-animate-labels">
+                  {satFrames.filter((_, i) => i % 2 === 0).map((f) => (
+                    <span key={f.hoursAgo}>
+                      {f.hoursAgo < 0.01
+                        ? "现在"
+                        : `${Math.round(f.hoursAgo * 60)} 分钟前`}
+                    </span>
+                  ))}
+                </div>
+              </div>
+              <p className="sat-animate-note">
+                30 分钟间隔 7 帧，过去 3 小时云团移动轨迹。点击播放按钮可动画
+                演示演变过程，拖动滑块逐帧查看。根据轨迹可直观判断云团走向，
+                结合风向外推验证。
+              </p>
+            </div>}
+          </div>}
         </aside>
         <div className="scene-wrap">
           <div className="view-switch" role="group" aria-label="场景视图">
@@ -2135,6 +3289,40 @@ export default function Home() {
               <Activity size={13} />
               剖面
             </button>
+            <button
+              className={sceneView === "sunpath" ? "active" : ""}
+              onClick={() => setSceneView("sunpath")}
+            >
+              <Sunrise size={13} />
+              光路
+            </button>
+          </div>
+          <div className="pitch-ctrl">
+            <span>仰角</span>
+            <button
+              onClick={() =>
+                setPitchOffset((v) => Math.max(-20, v - 5))
+              }
+              title="下俯 5°"
+            >
+              <ArrowDown size={13} />
+            </button>
+            <b>{pitchOffset > 0 ? "+" : ""}{pitchOffset}°</b>
+            <button
+              onClick={() =>
+                setPitchOffset((v) => Math.min(20, v + 5))
+              }
+              title="上仰 5°"
+            >
+              <ArrowUp size={13} />
+            </button>
+            <button
+              className={pitchOffset === 0 ? "active" : ""}
+              onClick={() => setPitchOffset(0)}
+              title="复位水平视线"
+            >
+              复位
+            </button>
           </div>
           {sceneView === "view" ? (
             <Scene
@@ -2150,16 +3338,40 @@ export default function Home() {
               viewBearing={bearing}
               scenario={scenario}
               wind500={wind500}
-              cape={cape}
-              precipitation={precipitation}
               aod={aod}
               visibilityKm={visibility / 1000}
               illumination={illum}
+              cb={demoCb}
+              genus={genus}
               event={event}
               lat={loc.lat}
               lon={loc.lon}
               onLookChange={setLookOffset}
+              pitch={pitchOffset}
             />
+          ) : sceneView === "sunpath" ? (
+            <div className="profile-frame">
+              <SunPathProfile
+                dem={data?.dem.grid || []}
+                demDepths={data?.dem.depths}
+                demLaterals={data?.dem.laterals}
+                stationElev={data?.weather.elevation ?? 500}
+                sunPathDistances={data?.sunPath?.distances}
+                sunPathCover={sunPathCover}
+                solar={solar}
+                event={event}
+                lat={loc.lat}
+                lon={loc.lon}
+                bearing={bearing}
+                mode={mode}
+                cover={cover}
+                heights={effectiveHeights}
+                profile={cloudProfileData}
+                cloudEdge={cloudEdge}
+                focal={focal}
+                look={pitchOffset}
+              />
+            </div>
           ) : (
             <div className="profile-frame">
               <TerrainProfile
@@ -2173,6 +3385,7 @@ export default function Home() {
                 lon={loc.lon}
                 bearing={bearing}
                 look={lookOffset}
+                pitch={pitchOffset}
                 focal={focal}
                 cover={cover}
                 visible={visible}
@@ -2180,6 +3393,7 @@ export default function Home() {
                 heights={effectiveHeights}
                 illum={illum}
                 profile={cloudProfileData}
+                overcast={parentOvercast}
               />
             </div>
           )}
@@ -2204,6 +3418,11 @@ export default function Home() {
               <span>
                 <Mountain size={14} />
                 {focal} mm · DEM 地形
+              </span>
+              <span>
+                <ArrowUp size={13} />
+                仰角 {pitchOffset > 0 ? "+" : ""}
+                {pitchOffset}°
               </span>
             </div>
           )}
@@ -2281,8 +3500,16 @@ export default function Home() {
                 ? "真实数据已接入"
                 : "当前使用安全占位场景"}
           </div>
+          <button
+            className="mob-toggle"
+            onClick={() => setMobileSettings(!mobileSettings)}
+            aria-label="切换设置面板"
+          >
+            <Settings size={14} />
+            <span>{mobileSettings ? "收起设置" : "观测设置"}</span>
+          </button>
         </div>
-        <aside className={`right-panel panel${dataPanel ? " open" : ""}`}>
+        <aside className="right-panel panel">
           <div className="score-head">
             <span>云底受光指数</span>
             <small>文档定量模型</small>
@@ -2306,7 +3533,6 @@ export default function Home() {
             {[
               ["几何可照亮", geometryScore],
               ["目标云量", cloudScore],
-              ["总云量", totalCloud],
               ["AOD通透", airScore],
               ["上游云廊", corridorScore],
             ].map(([name, value]) => (
@@ -2412,19 +3638,68 @@ export default function Home() {
           </div>
         </aside>
       </section>
-      <div
-        className={`panel-backdrop${dataPanel ? " open" : ""}`}
-        onClick={() => setDataPanel(false)}
-        aria-hidden="true"
-      />
-      <button
-        className="mobile-data-btn"
-        onClick={() => setDataPanel((v) => !v)}
-        aria-expanded={dataPanel}
-      >
-        <Database size={13} />
-        {dataPanel ? "收起" : "数据"}
-      </button>
+      <Dialog open={cityRankOpen} onOpenChange={setCityRankOpen}>
+        <DialogContent className="cityrank-dialog sm:max-w-[840px]">
+          <DialogHeader className="cityrank-header">
+            <DialogTitle>
+              <Trophy size={17} /> 今日推荐拍摄城市（前 20）
+            </DialogTitle>
+            <DialogDescription>
+              {mode === "sunset" ? "晚霞" : "朝霞"} · {selectedDateLabel} · 按主程序判定规则（受光/云量/通透/走廊）综合评分，点击即可跳转查询
+            </DialogDescription>
+            <button
+              className="cityrank-share"
+              onClick={shareCityRank}
+              disabled={cityRankSharing || !cityRanks.length}
+            >
+              <Share2 size={13} />
+              {cityRankSharing ? "生成中…" : shareReady ? "点击分享" : "分享图片"}
+            </button>
+          </DialogHeader>
+          <div className="cityrank-body">
+            {cityRankLoading && (
+              <p className="cityrank-empty">正在并发计算各城市拍摄价值…</p>
+            )}
+            {cityRankError && <p className="error">{cityRankError}</p>}
+            {!cityRankLoading && !cityRankError && cityRanks.length === 0 && (
+              <p className="cityrank-empty">暂无数据，请点击左侧按钮重新计算。</p>
+            )}
+            {!cityRankLoading &&
+              cityRanks.map((c, rank) => (
+                <div className="cityrank-item" key={c.name + c.province}>
+                  <button
+                    className="cityrank-row"
+                    onClick={() => pickCity(c)}
+                  >
+                    <span className={`cityrank-rank r-${rank < 3 ? rank + 1 : ""}`}>
+                      {rank + 1}
+                    </span>
+                    <span className="cityrank-name">
+                      <b>{c.name}</b>
+                      <small>{c.province}</small>
+                    </span>
+                    <span className="cityrank-tag">{c.tag}</span>
+                    <span className="cityrank-scenario">{c.scenario}</span>
+                    <span className="cityrank-window">{c.schedule}</span>
+                    <span className="cityrank-score">
+                      <b>{c.score}</b>
+                      <i style={{ width: `${c.score}%` }} />
+                    </span>
+                  </button>
+                  <div className="cityrank-profile">
+                    <CityCloudProfile
+                      profile={c.profile}
+                      cover={c.cover}
+                      mode={mode}
+                      illum={c.illum}
+                      overcast={c.overcast}
+                    />
+                  </div>
+                </div>
+              ))}
+          </div>
+        </DialogContent>
+      </Dialog>
       <AmapPicker
         open={mapOpen}
         initial={loc}

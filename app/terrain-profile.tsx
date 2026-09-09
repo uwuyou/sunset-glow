@@ -4,16 +4,12 @@
 import { useMemo } from "react";
 import { getPosition } from "suncalc";
 import type { CloudLayerProfile } from "./cloud-profile";
+import { renderCloudCanvas, type VolLayer } from "./cloud-volume";
 
 const PI = Math.PI;
 const rad = (v: number) => (v * PI) / 180;
 const deg = (v: number) => (v * 180) / PI;
 const normDeg = (v: number) => ((v % 360) + 360) % 360;
-// 确定性伪随机噪声（同参同值，保证跨渲染稳定）
-const noise = (x: number, y: number) => {
-  const s = Math.sin(x * 12.9898 + y * 78.233) * 43758.5453;
-  return s - Math.floor(s);
-};
 
 type Solar = { altitude: number; azimuth: number };
 
@@ -28,6 +24,7 @@ export default function TerrainProfile({
   lon,
   bearing,
   look,
+  pitch,
   focal,
   cover,
   visible,
@@ -35,6 +32,7 @@ export default function TerrainProfile({
   heights,
   illum,
   profile,
+  overcast,
 }: {
   dem: number[][];
   demDepths?: number[];
@@ -46,6 +44,7 @@ export default function TerrainProfile({
   lon: number;
   bearing: number;
   look: number;
+  pitch?: number;
   focal: number;
   cover: number[];
   visible: boolean[];
@@ -53,15 +52,21 @@ export default function TerrainProfile({
   heights?: number[];
   illum?: boolean[];
   profile?: CloudLayerProfile[];
+  overcast?: number;
 }) {
-  const rows = dem.length
-    ? dem
-    : [
+  // DEM 高程清洗：异常/非有限值回退 500m，避免 NaN 导致地形天际线消失
+  const rows = (dem.length ? dem : [
         [500, 510, 495, 505, 500],
         [510, 520, 500, 515, 508],
         [520, 530, 510, 525, 515],
-      ];
-  const depths =
+      ]).map((row) =>
+        row.map((v) => (Number.isFinite(Number(v)) ? Number(v) : 500)),
+      );
+  const pitchVal = Math.max(-18, Math.min(18, pitch ?? 0)),
+    overcastVal = overcast ?? 0,
+    // 焦段联动缩放：85mm 为基准 1.0，长焦 → 云层/太阳同步放大（视场同步收窄）
+    focalScale = Math.max(0.55, Math.min(2.6, focal / 85)),
+    depths =
       demDepths && demDepths.length > 1 ? demDepths : [2, 8, 18, 32, 48, 65, 82],
     lats =
       demLaterals && demLaterals.length > 1
@@ -167,7 +172,11 @@ export default function TerrainProfile({
     plotH = H - padT - padB,
     X = (az: number) =>
       padL + Math.max(0, Math.min(plotW, ((az + azHalf) / (2 * azHalf)) * plotW)),
-    Y = (alt: number) => padT + plotH - ((alt - minAlt) / (maxAlt - minAlt)) * plotH;
+    // 仰角调节：pitch > 0 上仰 → 视线中心上抬、天空占比增大（内容整体下移）。
+    // 每 1° 对应一个明显的像素偏移，切换时视图同步响应。
+    pitchShift = (pitchVal * plotH) / (maxAlt - minAlt),
+    Y = (alt: number) =>
+      padT + plotH - ((alt - minAlt) / (maxAlt - minAlt)) * plotH + pitchShift;
 
   const azTicks: number[] = [];
   for (let a = -azHalf; a <= azHalf; a += 10) azTicks.push(a);
@@ -187,207 +196,69 @@ export default function TerrainProfile({
       const f = Math.min(13, Math.max(0.2, km || 3)) / 13;
       return Math.max(0.6, Math.min(maxAlt - 1.2, f * maxAlt * 0.92));
     },
-    // 单簇云：主体多子斑堆叠 + 底部暗影（体积感）+ 朝向太阳一侧暖色银边
-    cloudCluster = (
-      key: number,
-      cx: number,
-      cy: number,
-      rx: number,
-      ry: number,
-      warm: number,
-      filt: string,
-      fill: string,
-    ) => {
-      const dir = sunX >= cx ? 1 : -1;
-      const lumps = 3 + Math.floor(noise(cx * 0.1, cy * 0.1) * 3);
-      const kids: React.ReactNode[] = [];
-      for (let k = 0; k < lumps; k++) {
-        const ox = (noise(cx * 0.1 + k * 3.1, cy * 0.1) - 0.5) * rx * 1.15,
-          oy = (noise(cx * 0.1, cy * 0.1 + k * 7.7) - 0.5) * ry * 1.35,
-          kr = rx * (0.42 + noise(cx * 0.1 + k, cy * 0.1 + k) * 0.52),
-          krh = ry * (0.5 + noise(cx * 0.1, cy * 0.1 + k * 3) * 0.72);
-        kids.push(
-          <ellipse key={k} cx={cx + ox} cy={cy + oy} rx={kr} ry={krh} fill={fill} />,
-        );
-      }
-      return (
-        <g key={key} filter={filt}>
-          <ellipse
-            cx={cx}
-            cy={cy + ry * 0.95}
-            rx={rx * 0.86}
-            ry={ry * 0.7}
-            fill="rgba(38,28,42,0.32)"
-          />
-          {kids}
-          {warm > 0.12 && (
-            <ellipse
-              cx={cx + dir * rx * 0.42}
-              cy={cy - ry * 0.3}
-              rx={rx * 0.6}
-              ry={ry * 0.45}
-              fill="rgba(255,216,150,0.55)"
-              opacity={Math.min(1, warm * 1.25)}
-            />
-          )}
-        </g>
+    // 体积云 Canvas 渲染：基于 Horizon: Zero Dawn 的 Perlin-Worley 噪声密度场，
+    // 取代原有的 CloudSat 离散柱体 + 椭圆簇方案
+    cloudCanvasUrl = useMemo(() => {
+      const W = 300,
+        H = 200;
+      const volLayers: VolLayer[] = [
+        {
+          base: Math.max(0.5, (heights?.[0] ?? 1.5) - 0.4),
+          top: (heights?.[0] ?? 1.5) + 0.8,
+          coverage: cloudLow,
+          genus: profile?.[0]?.genus ?? "stratocumulus",
+          phase: profile?.[0]?.phase ?? "liquid",
+          illum: illum?.[0] ?? true,
+          precip: profile?.[0]?.precip ?? "none",
+          seed: 37,
+        },
+        {
+          base: Math.max(3, (heights?.[1] ?? 5.5) - 0.5),
+          top: (heights?.[1] ?? 5.5) + 1.3,
+          coverage: cloudMid,
+          genus: profile?.[1]?.genus ?? "altocumulus",
+          phase: profile?.[1]?.phase ?? "mixed",
+          illum: illum?.[1] ?? true,
+          precip: profile?.[1]?.precip ?? "none",
+          seed: 23,
+        },
+        {
+          base: Math.max(7, (heights?.[2] ?? 10) - 0.3),
+          top: (heights?.[2] ?? 10) + 0.8,
+          coverage: cloudHigh,
+          genus: profile?.[2]?.genus ?? "cirrus",
+          phase: profile?.[2]?.phase ?? "ice",
+          illum: illum?.[2] ?? true,
+          precip: profile?.[2]?.precip ?? "none",
+          seed: 11,
+        },
+      ].filter((l, i) => visible[i] !== false && l.coverage > 0);
+
+      if (!volLayers.length) return null;
+      return renderCloudCanvas(
+        W,
+        H,
+        azHalf,
+        minAlt,
+        maxAlt,
+        volLayers,
+        mode,
+        overcastVal,
+        sunAz,
       );
-    },
-    // CloudSat 式垂直云柱：借鉴 CPR 毫米波雷达的垂直剖面观测——
-    // 云不再是一层皮，而是有云底/云顶/厚度的垂直柱。
-    // 每层按 profile 的 base→top 绘制柱体，顶部按水相着色，
-    // 降水云在柱底垂下雨幡，柱顶标注 CloudSat 2B-CLDCLASS 云型。
-    cloudColumn = (
-      layer: "high" | "mid" | "low",
-      prof: CloudLayerProfile,
-      seed: number,
-      lit = true,
-    ) => {
-      if (prof.cover <= 0) return null;
-      const baseY = Y(cloudElev(prof.base)),
-        topY = Y(cloudElev(prof.top)),
-        colH = Math.max(10, baseY - topY),
-        cfg =
-          layer === "high"
-            ? { filt: "url(#cldHi)", fill: "url(#cldGradHi)", ry: 3.4, ryAmp: 2.6, n: 7 }
-            : layer === "mid"
-              ? { filt: "url(#cldMi)", fill: "url(#cldGradMi)", ry: 5.2, ryAmp: 3.4, n: 8 }
-              : { filt: "url(#cldLo)", fill: "url(#cldGradLo)", ry: 7, ryAmp: 4.6, n: 8 },
-        wisp =
-          prof.genus === "cirrus" ||
-          prof.genus === "cirrostratus" ||
-          prof.genus === "cirrocumulus",
-        count = Math.max(
-          2,
-          Math.round((wisp ? cfg.n * 0.72 : cfg.n) * (0.55 + (prof.cover / 100) * 0.55)),
-        ),
-        op = (0.3 + (prof.cover / 100) * 0.55) * (lit ? 1 : 0.5),
-        // 水相着色：冰白 / 混合灰 / 液态暗
-        phaseFill =
-          prof.phase === "ice"
-            ? "rgba(232,240,248,0.5)"
-            : prof.phase === "mixed"
-              ? "rgba(205,214,222,0.42)"
-              : "rgba(158,176,189,0.38)";
-      const items: React.ReactNode[] = [];
-      // 1) 垂直柱体：云底到云顶的 CloudSat 剖面柱（半透明，带模糊）
-      items.push(
-        <rect
-          key="col"
-          x={padL}
-          y={topY}
-          width={plotW}
-          height={colH}
-          rx={7}
-          fill={phaseFill}
-          opacity={lit ? 1 : 0.5}
-          filter="url(#cldMi)"
-        />,
-      );
-      // 2) 云泡簇：沿柱体高度分布，顶部更密（云顶凸起）
-      for (let i = 0; i < count; i++) {
-        const t = (i + 0.5) / count,
-          cx =
-            padL +
-            t * plotW +
-            (noise(t * 9.3 + seed, 3.1) - 0.5) * 30,
-          cy =
-            topY +
-            colH * (0.3 + 0.55 * noise(t * 5.7 + seed, 1.3)) +
-            Math.sin(t * 6.28 + seed * 1.7) * 3,
-          rx = (plotW / count) * (0.66 + noise(t * 7.1 + seed, 5.5) * 0.55),
-          ry = (wisp ? cfg.ry * 0.6 : cfg.ry) + noise(t * 11.3 + seed, 1.7) * cfg.ryAmp,
-          dist = Math.abs(cx - sunX) / plotW,
-          warm = lit ? Math.max(0, 1 - dist * 2.2) : 0,
-          jit = 0.8 + noise(t * 5.3 + seed, 7.7) * 0.4;
-        items.push(
-          <g key={`c${i}`} opacity={jit}>
-            {cloudCluster(i, cx, cy, rx, ry, warm, cfg.filt, cfg.fill)}
-          </g>,
-        );
-      }
-      // 3) 降水雨幡：降水云在云底下方垂落（雪为虚线、雨为实线）
-      if (prof.precip !== "none") {
-        const sn = 4 + Math.round(prof.cover / 25);
-        for (let s = 0; s < sn; s++) {
-          const x0 =
-              padL +
-              ((s + 0.5) / sn) * plotW +
-              (noise(s * 3.7, seed) - 0.5) * 24,
-            len = Math.min(46, colH * (0.5 + noise(s * 7.1, seed + 2) * 0.5)),
-            sway = (noise(s * 9.3, seed + 5) - 0.5) * 8;
-          items.push(
-            <path
-              key={`p${s}`}
-              d={`M${x0},${baseY} q${sway},${len * 0.5} ${sway * 1.6},${len}`}
-              stroke={
-                prof.precip === "snow"
-                  ? "rgba(220,232,240,0.5)"
-                  : "rgba(120,140,160,0.45)"
-              }
-              strokeWidth={1.1}
-              strokeDasharray={prof.precip === "snow" ? "2 2" : undefined}
-              fill="none"
-              opacity={lit ? 0.55 : 0.3}
-            />,
-          );
-        }
-      }
-      // 4) 高云附加纤薄丝缕：卷云感（wisp 时更密）
-      if (layer === "high") {
-        const sn = wisp ? 6 : 3;
-        for (let s = 0; s < sn; s++) {
-          const y0 = topY + colH * (0.2 + noise(s * 4.1, 9.1) * 0.6),
-            x0 = padL + noise(s * 8.3, 2.2) * plotW * 0.35,
-            len = plotW * (0.3 + noise(s * 3.7, 6.4) * 0.32);
-          items.push(
-            <path
-              key={`w${s}`}
-              d={`M${x0},${y0} q${len * 0.3},${2 + noise(s, 7.7) * 3} ${len * 0.6},0 q${len * 0.25},-2 ${len * 0.4},0`}
-              stroke={cfg.fill}
-              strokeWidth={wisp ? 1.1 : 1.4}
-              fill="none"
-              opacity={lit ? 0.5 : 0.28}
-              filter="url(#cldHi)"
-            />,
-          );
-        }
-      }
-      // 5) CloudSat 云型标注：柱顶上方（云型 + 云底–云顶高度）
-      if (prof.cover >= 18) {
-        const labelX =
-          padL + plotW * 0.5 + (noise(seed, 4.2) - 0.5) * plotW * 0.4;
-        items.push(
-          <g key="lab">
-            <text
-              x={labelX}
-              y={Math.max(12, topY - 4)}
-              fill={lit ? "#e8f0f4" : "#9fb0b8"}
-              fontSize="9"
-              textAnchor="middle"
-              opacity={0.85}
-            >
-              {prof.type}
-            </text>
-            <text
-              x={labelX}
-              y={Math.max(22, topY - 4 + 9)}
-              fill="#7f9390"
-              fontSize="7.5"
-              textAnchor="middle"
-              opacity={0.7}
-            >
-              {prof.base.toFixed(1)}–{prof.top.toFixed(1)}km
-            </text>
-          </g>,
-        );
-      }
-      return (
-        <g key={layer} opacity={op}>
-          {items}
-        </g>
-      );
-    };
+    }, [heights, cloudLow, cloudMid, cloudHigh, profile, illum, visible, azHalf, minAlt, maxAlt, overcastVal, sunAz, mode]),
+    // 获取云层信息的辅助函数（用于保留的降水/标注）
+    profOf = (i: number): CloudLayerProfile =>
+      profile?.[i] ?? {
+        genus: (["stratocumulus", "altocumulus", "cirrus"] as const)[i],
+        type: ["层积云 Sc", "高积云 Ac", "卷云 Ci"][i],
+        base: Math.max(0.5, (heights?.[i] ?? [1.5, 5.5, 10][i]) - 0.4),
+        top: (heights?.[i] ?? [1.5, 5.5, 10][i]) + 0.8,
+        thickness: 1.2,
+        phase: i === 2 ? "ice" : i === 1 ? "mixed" : "liquid",
+        precip: "none",
+        cover: [cloudLow, cloudMid, cloudHigh][i],
+      };
 
   return (
     <svg
@@ -408,16 +279,16 @@ export default function TerrainProfile({
           {mode === "dawn" ? (
             <>
               <stop offset="0" stopColor="#10182e" />
-              <stop offset="0.55" stopColor="#243a4d" />
-              <stop offset="0.85" stopColor="#6d4a5b" />
-              <stop offset="1" stopColor="#b06a4b" />
+              <stop offset="0.55" stopColor="#1f3345" />
+              <stop offset="0.85" stopColor="#57394b" />
+              <stop offset="1" stopColor="#8d5739" />
             </>
           ) : (
             <>
               <stop offset="0" stopColor="#1c1426" />
-              <stop offset="0.5" stopColor="#4a2330" />
-              <stop offset="0.82" stopColor="#9a4a33" />
-              <stop offset="1" stopColor="#e08a45" />
+              <stop offset="0.5" stopColor="#3f1f2c" />
+              <stop offset="0.82" stopColor="#7c3a2c" />
+              <stop offset="1" stopColor="#b96f3c" />
             </>
           )}
         </linearGradient>
@@ -431,62 +302,20 @@ export default function TerrainProfile({
           <stop offset="0.4" stopColor="rgba(255,170,80,0.32)" />
           <stop offset="1" stopColor="rgba(255,120,40,0)" />
         </radialGradient>
-        {/* 云层分形滤镜：高云水平丝缕 / 中云层状 / 低云厚重块状 */}
-        <filter id="cldHi" x="-40%" y="-80%" width="180%" height="260%">
-          <feTurbulence type="fractalNoise" baseFrequency="0.02 0.1" numOctaves="3" seed="11" result="n" />
-          <feDisplacementMap in="SourceGraphic" in2="n" scale="10" xChannelSelector="R" yChannelSelector="G" />
-          <feGaussianBlur stdDeviation="0.8" />
-        </filter>
-        <filter id="cldMi" x="-40%" y="-80%" width="180%" height="260%">
-          <feTurbulence type="fractalNoise" baseFrequency="0.014 0.05" numOctaves="3" seed="23" result="n" />
-          <feDisplacementMap in="SourceGraphic" in2="n" scale="13" xChannelSelector="R" yChannelSelector="G" />
-          <feGaussianBlur stdDeviation="1" />
-        </filter>
-        <filter id="cldLo" x="-40%" y="-80%" width="180%" height="260%">
-          <feTurbulence type="fractalNoise" baseFrequency="0.01 0.028" numOctaves="4" seed="37" result="n" />
-          <feDisplacementMap in="SourceGraphic" in2="n" scale="17" xChannelSelector="R" yChannelSelector="G" />
-          <feGaussianBlur stdDeviation="1.3" />
-        </filter>
-        {/* 云层渐变：顶部冷灰、底部被日出/日落低角度暖光映亮 */}
-        {mode === "sunset" ? (
-          <>
-            <linearGradient id="cldGradHi" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0" stopColor="#e2e9ec" stopOpacity="0.95" />
-              <stop offset="0.5" stopColor="#d3d5d2" stopOpacity="0.92" />
-              <stop offset="1" stopColor="#e3a26a" stopOpacity="0.9" />
-            </linearGradient>
-            <linearGradient id="cldGradMi" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0" stopColor="#d3dcde" stopOpacity="0.95" />
-              <stop offset="0.55" stopColor="#c5bcb4" stopOpacity="0.92" />
-              <stop offset="1" stopColor="#e8944e" stopOpacity="0.9" />
-            </linearGradient>
-            <linearGradient id="cldGradLo" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0" stopColor="#bfcbcd" stopOpacity="0.95" />
-              <stop offset="0.6" stopColor="#ab9c8a" stopOpacity="0.92" />
-              <stop offset="1" stopColor="#e3843f" stopOpacity="0.9" />
-            </linearGradient>
-          </>
-        ) : (
-          <>
-            <linearGradient id="cldGradHi" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0" stopColor="#dfe6ec" stopOpacity="0.95" />
-              <stop offset="0.5" stopColor="#d0d4da" stopOpacity="0.92" />
-              <stop offset="1" stopColor="#e08aa0" stopOpacity="0.9" />
-            </linearGradient>
-            <linearGradient id="cldGradMi" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0" stopColor="#cdd6dc" stopOpacity="0.95" />
-              <stop offset="0.55" stopColor="#bcbec6" stopOpacity="0.92" />
-              <stop offset="1" stopColor="#e2788e" stopOpacity="0.9" />
-            </linearGradient>
-            <linearGradient id="cldGradLo" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0" stopColor="#b9c5cc" stopOpacity="0.95" />
-              <stop offset="0.6" stopColor="#a5a3ac" stopOpacity="0.92" />
-              <stop offset="1" stopColor="#e0687c" stopOpacity="0.9" />
-            </linearGradient>
-          </>
-        )}
       </defs>
       <rect x="0" y="0" width={W} height={H} fill="url(#tprofSky)" />
+      {/* 体积云 Canvas 图层：基于 Perlin-Worley 噪声密度场的连续体积渲染 */}
+      {cloudCanvasUrl && (
+        <image
+          href={cloudCanvasUrl}
+          x={padL}
+          y={padT}
+          width={plotW}
+          height={plotH}
+          preserveAspectRatio="none"
+          opacity={0.85}
+        />
+      )}
       {/* 焦段视场带：当前焦距对应的相机水平视场 */}
       <rect
         x={X(-fovHalf)}
@@ -523,34 +352,7 @@ export default function TerrainProfile({
           </text>
         </g>
       ))}
-      {/* CloudSat 云剖面：低/中/高云垂直柱，云底/云顶/厚度驱动仰角带，
-          水相着色、降水雨幡、2B-CLDCLASS 云型标注；受光状态联动取景界面 */}
-      {(() => {
-        const profOf = (i: number): CloudLayerProfile =>
-          profile?.[i] ?? {
-            genus: (["stratocumulus", "altocumulus", "cirrus"] as const)[i],
-            type: ["层积云 Sc", "高积云 Ac", "卷云 Ci"][i],
-            base: Math.max(0.5, (heights?.[i] ?? [1.5, 5.5, 10][i]) - 0.4),
-            top: (heights?.[i] ?? [1.5, 5.5, 10][i]) + 0.8,
-            thickness: 1.2,
-            phase: i === 2 ? "ice" : i === 1 ? "mixed" : "liquid",
-            precip: "none",
-            cover: [cloudLow, cloudMid, cloudHigh][i],
-          };
-        return (
-          <>
-            {visible[2] &&
-              cloudHigh > 0 &&
-              cloudColumn("high", profOf(2), 11, illum?.[2])}
-            {visible[1] &&
-              cloudMid > 0 &&
-              cloudColumn("mid", profOf(1), 23, illum?.[1])}
-            {visible[0] &&
-              cloudLow > 0 &&
-              cloudColumn("low", profOf(0), 37, illum?.[0])}
-          </>
-        );
-      })()}
+      {/* 体积云已在 Canvas 图层中渲染，云型标注可在后续版本叠加 */}
       <line
         x1={padL}
         y1={Y(0)}
@@ -621,11 +423,11 @@ export default function TerrainProfile({
       {/* 当前太阳：被山遮挡时降格显示 */}
       {Math.abs(currentSun.az) <= azHalf ? (
         <g>
-          <circle cx={X(currentSun.az)} cy={Y(currentSun.alt)} r="22" fill="url(#tprofGlow)" />
+          <circle cx={X(currentSun.az)} cy={Y(currentSun.alt)} r={22 * focalScale} fill="url(#tprofGlow)" />
           <circle
             cx={X(currentSun.az)}
             cy={Y(currentSun.alt)}
-            r="5"
+            r={5 * focalScale}
             fill={blocked ? "#9aa5a1" : "#fff1b3"}
           />
           <text
@@ -663,6 +465,7 @@ export default function TerrainProfile({
       <text x={padL} y={padT + 13} fill="#9db0ac" fontSize="10">
         视线 {(bearing - look + 360) % 360}° · {focal}mm 视场 ±
         {fovHalf.toFixed(0)}° · 纵向 ×1.8
+        {pitchVal !== 0 ? ` · 仰角 ${pitchVal > 0 ? "+" : ""}${pitchVal.toFixed(0)}°` : ""}
       </text>
       <text x={W - padR} y={padT + 13} fill="#7f9390" fontSize="9" textAnchor="end">
         {mode === "sunset" ? "日落" : "日出"} · 云 低{Math.round(cloudLow)}

@@ -8,6 +8,10 @@ export default defineConfig({
   base: "/sunset-glow/",
   publicDir: "../public",
   plugins: [react()],
+  define: {
+    // 静态托管标记：跳过 /api/scene 代理请求，直接浏览器直连 Open-Meteo
+    __STATIC__: JSON.stringify(true),
+  },
   build: {
     outDir: "../pages-dist",
     emptyOutDir: true,

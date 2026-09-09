@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { forecastUpdateAt, sceneUrls } from "../../scene-urls";
+import { getPrimarySatellite } from "../../satellite";
 
 const R = 6371;
 function destination(lat: number, lon: number, bearing: number, km: number) {
@@ -43,21 +43,30 @@ export async function GET(req: NextRequest) {
   );
   const corridorLats = corridorPoints.map((p) => p[0].toFixed(5)).join(",");
   const corridorLons = corridorPoints.map((p) => p[1].toFixed(5)).join(",");
-  const {
-    wf: forecast,
-    dem: elevation,
-    vis: visibility,
-    air,
-    corridor,
-  } = sceneUrls({ lat, lon, lats, lons, corridorLats, corridorLons });
+  // 日出/日落光路剖面：沿太阳方位细粒度采样云量（0→200km）
+  const sunPathDistances = [0, 5, 10, 15, 20, 25, 30, 40, 50, 60, 70, 80, 100, 120, 150, 180, 200],
+    sunPathPoints = sunPathDistances.map((km) =>
+      destination(lat, lon, bearing, km),
+    ),
+    sunPathLats = sunPathPoints.map((p) => p[0].toFixed(5)).join(","),
+    sunPathLons = sunPathPoints.map((p) => p[1].toFixed(5)).join(",");
+  const vars =
+    "cloud_cover_low,cloud_cover_mid,cloud_cover_high,direct_radiation,diffuse_radiation,boundary_layer_height,geopotential_height_850hPa,geopotential_height_500hPa,geopotential_height_250hPa";
+  const forecast = `https://api.open-meteo.com/v1/ecmwf?latitude=${lat}&longitude=${lon}&hourly=${vars}&daily=sunrise,sunset&timezone=Asia%2FShanghai&forecast_days=7`;
+  const elevation = `https://api.open-meteo.com/v1/elevation?latitude=${lats}&longitude=${lons}`;
+  const visibility = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&hourly=visibility,cloud_cover_low,cloud_cover_mid,cloud_cover_high,precipitation,cape,wind_speed_500hPa,wind_direction_500hPa&timezone=Asia%2FShanghai&forecast_days=7`;
+  const air = `https://air-quality-api.open-meteo.com/v1/air-quality?latitude=${lat}&longitude=${lon}&hourly=aerosol_optical_depth,pm2_5&timezone=Asia%2FShanghai&forecast_days=7`;
+  const corridor = `https://api.open-meteo.com/v1/ecmwf?latitude=${corridorLats}&longitude=${corridorLons}&hourly=cloud_cover_low,cloud_cover_mid,cloud_cover_high&timezone=Asia%2FShanghai&forecast_days=7`;
+  const sunPath = `https://api.open-meteo.com/v1/ecmwf?latitude=${sunPathLats}&longitude=${sunPathLons}&hourly=cloud_cover_low,cloud_cover_mid,cloud_cover_high&timezone=Asia%2FShanghai&forecast_days=7`;
   try {
-    const [wfResult, demResult, visResult, aqResult, corResult] =
+    const [wfResult, demResult, visResult, aqResult, corResult, sunPathResult] =
       await Promise.allSettled([
         fetch(forecast),
         fetch(elevation),
         fetch(visibility),
         fetch(air),
         fetch(corridor),
+        fetch(sunPath),
       ]);
     if (wfResult.status !== "fulfilled" || !wfResult.value.ok)
       throw new Error(
@@ -88,12 +97,14 @@ export async function GET(req: NextRequest) {
       corResult.status === "fulfilled" && corResult.value.ok
         ? await corResult.value.json()
         : [];
+    const sunPathData =
+      sunPathResult.status === "fulfilled" && sunPathResult.value.ok
+        ? await sunPathResult.value.json()
+        : [];
     const grid = depths.map((_, di) =>
       laterals.map((__, li) => elevations[di * laterals.length + li]),
     );
-    const d = new Date(Date.now() - 86400000).toISOString().slice(0, 10),
-      bbox = `${lon - 4},${lat - 3},${lon + 4},${lat + 3}`;
-    const satellite = `https://gibs.earthdata.nasa.gov/wms/epsg4326/best/wms.cgi?SERVICE=WMS&REQUEST=GetMap&VERSION=1.1.1&LAYERS=VIIRS_SNPP_CorrectedReflectance_TrueColor&STYLES=&FORMAT=image/jpeg&TRANSPARENT=false&HEIGHT=300&WIDTH=420&SRS=EPSG:4326&BBOX=${bbox}&TIME=${d}`;
+    const satellite = await getPrimarySatellite(lat, lon);
     return NextResponse.json(
       {
         weather,
@@ -103,9 +114,12 @@ export async function GET(req: NextRequest) {
           distances: corridorDistances,
           forecasts: Array.isArray(corridorData) ? corridorData : [],
         },
+        sunPath: {
+          distances: sunPathDistances,
+          forecasts: Array.isArray(sunPathData) ? sunPathData : [],
+        },
         satellite,
         updated: new Date().toISOString(),
-        modelUpdate: forecastUpdateAt(new Date()).toISOString(),
       },
       { headers: { "Cache-Control": "public, max-age=900" } },
     );
