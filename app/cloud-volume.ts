@@ -151,7 +151,13 @@ export function sampleCloudDensity(
     (1 - worley(x * 40, y * 40)) * 0.2;
   density = Math.max(0, Math.min(1, (density - hfDetail * 0.16) / (1 - hfDetail * 0.16)));
 
-  // 7) 低密度截断：避免雾状拖尾（阈值降低，保留更多边缘云）
+  // 7) 密度固化：gamma<1 提亮中低密度。
+  //    仅做覆盖率→填充率标定后，幸存像素密度普遍偏低（0.1~0.4），
+  //    再叠加渲染端的 alpha≈density×0.35 后几乎隐形，导致观感"云量偏少"。
+  //    0.62 次幂把 0.2→0.37、0.4→0.56、0.6→0.72，让云芯成块、边缘清晰。
+  density = Math.pow(Math.max(0, density), 0.62);
+
+  // 8) 低密度截断：避免雾状拖尾（阈值降低，保留更多边缘云）
   if (density < 0.012) {
     // 用平滑台阶替代硬裁剪，避免边缘割裂
     density = density < 0.004 ? 0 : density * (density - 0.004) / (0.012 - 0.004);
@@ -291,8 +297,12 @@ export function renderCloudCanvas(
           b *= 1.05;
         }
 
-        // 密度决定不透明度
-        const alpha = density * (0.35 + 0.55 * warmFactor) * (isLit ? 1 - oc * 0.3 : 0.3 - oc * 0.12);
+        // 密度决定不透明度（0.5 基准较旧 0.35 更实，云量观感与分层云面板对齐；
+        // 未受光层基准 0.3→0.42，边缘云不再隐形）
+        const alpha =
+          density *
+          (0.5 + 0.5 * warmFactor) *
+          (isLit ? 1 - oc * 0.3 : 0.42 - oc * 0.12);
 
         // Alpha 混合
         const a = alpha * 255;
